@@ -274,6 +274,17 @@ def is_loopback(host: str) -> bool:
         return False
 
 
+def public_origin() -> tuple[str, str] | None:
+    """HARVEY_PUBLIC_ORIGIN (e.g. "https://admin.crabroom.com"): the one public origin, besides loopback, that may reach the
+    dashboard, for a deployment behind an HTTPS reverse proxy that itself requires a password. Returns (origin, host) or None.
+    The bearer token is still required for every API call; this only lets that one exact Host and Origin through."""
+    value = os.environ.get("HARVEY_PUBLIC_ORIGIN", "").strip().rstrip("/").lower()
+    if not value.startswith("https://") or "/" in value[len("https://"):]:
+        return None
+    host = parse_host(value[len("https://"):])
+    return (value, value[len("https://"):]) if host else None
+
+
 def is_public_path(method: str, path: str) -> bool:
     if method not in ("GET", "HEAD"):
         return False
@@ -340,10 +351,13 @@ class DashboardGuard:
         # 1. Host, before anything else.
         hosts = headers.get("host", [])
         host = parse_host(hosts[0]) if len(hosts) == 1 else None
-        if host is None or not is_loopback(host):
+        pub = public_origin()
+        via_public = pub is not None and len(hosts) == 1 and hosts[0].lower() == pub[1]
+        if host is None or not (is_loopback(host) or via_public):
             return await deny(400, "bad_host",
                               "This dashboard only answers to localhost / 127.0.0.1.")
         host_header = hosts[0].lower()
+        expected_origin = pub[0] if via_public else f"http://{host_header}"
 
         # 2. Browser provenance.
         public = is_public_path(method, path)
@@ -351,7 +365,7 @@ class DashboardGuard:
                       and headers.get("sec-fetch-mode", [""])[0] == "navigate"
                       and headers.get("sec-fetch-dest", [""])[0] == "document")
         origins = headers.get("origin", [])
-        if origins and (len(origins) != 1 or origins[0].lower() != f"http://{host_header}"):
+        if origins and (len(origins) != 1 or origins[0].lower() != expected_origin):
             if not navigation:
                 return await deny(403, "cross_origin", "Cross-origin requests are refused.")
         site = headers.get("sec-fetch-site", [])

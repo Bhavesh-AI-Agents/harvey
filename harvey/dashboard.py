@@ -2604,6 +2604,21 @@ async def get_runs_api():
 
 WEB_DIR = (Path(__file__).resolve().parent / "web")
 
+# HARVEY_BASE_PATH (e.g. "/harvey"): serve the dashboard under a path of a shared host, behind a proxy that strips the prefix
+# before requests reach this server. The page, its stylesheet and auth.js put the prefix back on the dashboard's own URLs.
+# Unset (the default) changes nothing.
+BASE_PATH = os.environ.get("HARVEY_BASE_PATH", "").strip().rstrip("/")
+if BASE_PATH and (not BASE_PATH.startswith("/") or not all(c.isalnum() or c in "/-_" for c in BASE_PATH)):
+    BASE_PATH = ""
+
+
+def _with_base(text: str) -> str:
+    if not BASE_PATH:
+        return text
+    for q in ('"', "'", "("):
+        text = text.replace(q + "/static/", q + BASE_PATH + "/static/")
+    return text
+
 
 TEXT_TYPES = {".css": "text/css", ".js": "text/javascript", ".svg": "image/svg+xml"}
 BINARY_TYPES = {".woff2": "font/woff2", ".woff": "font/woff", ".png": "image/png"}
@@ -2630,7 +2645,7 @@ async def static_file(path: str):
             headers={"Cache-Control": "public, max-age=604800"},
         )
     return PlainTextResponse(
-        target.read_text(encoding="utf-8"),
+        _with_base(target.read_text(encoding="utf-8")) if target.suffix == ".css" else target.read_text(encoding="utf-8"),
         media_type=TEXT_TYPES.get(target.suffix, "text/plain"),
         headers={"Cache-Control": "no-store"},
     )
@@ -2638,7 +2653,10 @@ async def static_file(path: str):
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    return (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    if BASE_PATH:
+        html = _with_base(html).replace("<head>", f'<head>\n<meta name="harvey-base" content="{BASE_PATH}">', 1)
+    return html
 
 
 class DashboardSetupError(Exception):

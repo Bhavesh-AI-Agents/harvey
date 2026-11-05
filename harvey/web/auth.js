@@ -33,10 +33,15 @@ function clearAuthToken() {
   try { sessionStorage.removeItem(AUTH_KEY); } catch { /* ignore */ }
 }
 
+// The dashboard's path prefix when it is served under a shared host (HARVEY_BASE_PATH, set by the server in a meta tag).
+const HARVEY_BASE = (typeof document !== 'undefined' && document.querySelector &&
+  (document.querySelector('meta[name="harvey-base"]') || {}).content) || '';
+
 // A same-origin URL for an absolute path ("/api/..."), or null.
 function sameOriginUrl(path) {
   if (typeof path !== 'string' || !path.startsWith('/') || path.startsWith('//') ||
       path.includes('\\')) return null;
+  if (HARVEY_BASE && path !== HARVEY_BASE && !path.startsWith(HARVEY_BASE + '/')) path = HARVEY_BASE + path;
   let url;
   try { url = new URL(path, window.location.origin); } catch { return null; }
   return url.origin === window.location.origin ? url : null;
