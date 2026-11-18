@@ -1135,8 +1135,13 @@ def _find_config_file() -> str:
         PROJECT_ROOT / "harvey.yaml",
     ]
     for path in candidates:
-        if path.exists():
-            return str(path)
+        try:
+            if path.exists():
+                return str(path)
+        except OSError:
+            # A folder this user may not look into (Harvey started from
+            # someone else's home, say) holds no config for us.
+            continue
     raise ConfigFileNotFoundError(
         "harvey.yaml not found in "
         + ", ".join(str(p.parent) for p in candidates)
