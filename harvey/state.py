@@ -2729,6 +2729,62 @@ class StateManager:
                     stats.append(d)
                 return stats
 
+    async def campaign_numbers(self) -> dict[str, dict]:
+        """For every campaign: first emails sent, replies, and how many
+        replied interested. Keyed by campaign id."""
+        out: dict[str, dict] = {}
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT campaign_id, COUNT(*) FROM outbox WHERE status = 'sent' "
+                "AND step = 1 AND kind = 'sequence' AND campaign_id != '' GROUP BY campaign_id"
+            ) as cursor:
+                for cid, n in await cursor.fetchall():
+                    out[cid] = {"sent": n, "replies": 0, "interested": 0}
+            async with db.execute(
+                "SELECT campaign_id, COUNT(DISTINCT prospect_id), "
+                "COUNT(DISTINCT CASE WHEN intent = 'interested' THEN prospect_id END) "
+                "FROM conversations WHERE campaign_id != '' AND intent != '' GROUP BY campaign_id"
+            ) as cursor:
+                for cid, replies, interested in await cursor.fetchall():
+                    row = out.setdefault(cid, {"sent": 0, "replies": 0, "interested": 0})
+                    row["replies"], row["interested"] = replies, interested or 0
+        return out
+
+    async def campaign_results(self, min_sent: int = 20) -> list[dict]:
+        """Campaigns with at least min_sent first emails sent, best reply
+        rate first, with the A/B angle and follow-up subject each used."""
+        numbers = await self.campaign_numbers()
+        keep = {cid: n for cid, n in numbers.items() if n["sent"] >= max(1, int(min_sent))}
+        if not keep:
+            return []
+        rows = []
+        async with self._connect() as db:
+            for cid, n in keep.items():
+                async with db.execute(
+                    "SELECT name, sequence_json FROM campaigns WHERE id = ?", (cid,)) as cursor:
+                    found = await cursor.fetchone()
+                if not found:
+                    continue
+                subject = ""
+                try:
+                    sequence = json.loads(found[1] or "[]")
+                    if len(sequence) > 1:
+                        subject = str(sequence[1].get("subject") or "")[:80]
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    pass
+                async with db.execute(
+                    "SELECT value FROM settings WHERE key = ?", ("campaign_variant:" + cid,)) as cursor:
+                    variant = await cursor.fetchone()
+                angle = ""
+                if variant:
+                    try:
+                        angle = str(json.loads(variant[0]).get("angle") or "")[:400]
+                    except (json.JSONDecodeError, TypeError, AttributeError):
+                        pass
+                rows.append({**n, "id": cid, "name": found[0], "subject": subject, "angle": angle})
+        rows.sort(key=lambda r: (r["replies"] / r["sent"], r["sent"]), reverse=True)
+        return rows
+
     async def get_intent_distribution(self) -> dict[str, int]:
         """Count conversations by intent."""
         async with self._connect() as db:

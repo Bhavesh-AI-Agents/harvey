@@ -1479,8 +1479,139 @@ async function saveBusiness() {
   if (data && data.success) loadBusiness();
 }
 
+// ---- Product knowledge ----
+async function loadKnowledge() {
+  const el = document.getElementById('knowledge-card');
+  if (!el) return;
+  const data = await api('/api/product-knowledge');
+  if (!data) { el.innerHTML = offlineState(); return; }
+  el.innerHTML = '<div class="card"><div class="card-body">' +
+    (data.text ? '' : '<p class="desc" style="margin:0 0 10px">Nothing saved yet. Until there is, Harvey writes only from the few lines in Your business.</p>') +
+    '<textarea class="form-input" id="knowledge-text" rows="16" maxlength="' + data.max + '" ' +
+    'placeholder="Plain text or markdown. Only what may be said to a prospect.">' + escHtml(data.text || '') + '</textarea>' +
+    '<div style="margin-top:12px"><button class="btn btn-primary" onclick="saveKnowledge()">Save product knowledge</button></div>' +
+    '</div></div>';
+}
+
+async function saveKnowledge() {
+  const data = await api('/api/product-knowledge', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({text: document.getElementById('knowledge-text').value}),
+  });
+  showToast(data && data.success ? 'Saved. Harvey writes from this from its next cycle.'
+                                  : (data && data.message) || 'Could not save.', data && data.success ? 'success' : 'error');
+  if (data && data.success) loadKnowledge();
+}
+
+// ---- Campaign rules ----
+let _rules = null;
+function ruleCheck(key, label, v) {
+  return '<label style="display:flex;gap:8px;align-items:center;margin:6px 0;cursor:pointer">' +
+    '<input type="checkbox" id="rule-' + key + '"' + (v[key] ? ' checked' : '') + ' onchange="rulesToggle()"> ' + label + '</label>';
+}
+function ruleSection(title, why, inner) {
+  return '<div class="rule-block"><h4>' + title + '</h4><p class="desc">' + why + '</p>' + inner + '</div>';
+}
+async function loadRules() {
+  const el = document.getElementById('rules-card');
+  if (!el) return;
+  const data = await api('/api/campaign-rules');
+  if (!data) { el.innerHTML = offlineState(); return; }
+  drawRules(data, data.saved ? data.values : data.recommended);
+}
+function drawRules(data, v) {
+  const el = document.getElementById('rules-card');
+  _rules = data;
+  const steps = v.sequence_steps;
+  const delays = (v.sequence_delays && v.sequence_delays.length === steps - 1)
+    ? v.sequence_delays : data.built_in.delays[String(steps)];
+  let html = '<div class="card"><div class="card-body">';
+  if (!data.saved) {
+    html += '<div class="rule-note">These are the recommended settings and are <b>not in force yet</b>. ' +
+      'Today Harvey sends at any hour, writes 3 emails over 7 days, and does not test or learn. Press Save to apply them.</div>';
+  }
+  html += ruleSection('When emails go out',
+    'Cold email gets the most replies in working hours, in the reader\'s own time zone. Replies to people who wrote back are never held.',
+    ruleCheck('send_window_on', 'Only send cold email inside these hours', v) +
+    '<div class="rule-row" id="rule-window-fields">' +
+      '<label>From <input class="form-input" type="time" id="rule-send_start" value="' + escHtml(v.send_start) + '"></label>' +
+      '<label>Until <input class="form-input" type="time" id="rule-send_end" value="' + escHtml(v.send_end) + '"></label></div>' +
+    ruleCheck('weekdays_only', 'Monday to Friday only', v) +
+    ruleCheck('recipient_timezone', 'Use each person\'s own time zone (off: one zone for everyone, the one under quiet hours)', v));
+  html += ruleSection('Follow-ups',
+    'Most replies come from follow-ups. The evidence favours 5 or 6 short touches over about three weeks, then stopping. ' +
+    'Email 1 is the opener, email 2 brings one proof point, the ones in between are one-line bumps, the last says goodbye. ' +
+    'A reply from anyone at the company stops the rest.',
+    '<div class="rule-row"><label>Emails in a sequence <select class="form-input" id="rule-sequence_steps" onchange="rulesSteps()">' +
+      [2, 3, 4, 5, 6].map(n => '<option value="' + n + '"' + (n === steps ? ' selected' : '') + '>' + n + '</option>').join('') +
+      '</select></label></div><div class="rule-row" id="rule-delays"></div><p class="desc" id="rule-span"></p>');
+  html += ruleSection('A/B testing',
+    'Splits a group in two, writes each half with a different angle, and shows sent and replies for each half on the Campaigns tab. ' +
+    'Needs enough people per half to mean anything: read the result only after about 25 sends each.',
+    ruleCheck('ab_test', 'Test two angles on each new group', v) +
+    '<div class="rule-row"><label>Only split groups of at least <input class="form-input" type="number" min="4" max="1000" id="rule-ab_min_prospects" value="' + escHtml(String(v.ab_min_prospects)) + '"> people</label></div>' +
+    '<label class="rule-wide">Angle A <span class="muted">(blank: built in)</span><textarea class="form-input" rows="2" maxlength="400" id="rule-ab_angle_a" placeholder="' + escHtml(data.built_in.ab_angle_a) + '">' + escHtml(v.ab_angle_a || '') + '</textarea></label>' +
+    '<label class="rule-wide">Angle B <span class="muted">(blank: built in)</span><textarea class="form-input" rows="2" maxlength="400" id="rule-ab_angle_b" placeholder="' + escHtml(data.built_in.ab_angle_b) + '">' + escHtml(v.ab_angle_b || '') + '</textarea></label>');
+  html += ruleSection('Learn from results',
+    'Before writing a new campaign, Harvey is shown how earlier ones did (sent, replies, interested) and leans toward what earned replies. ' +
+    'Opens are not tracked on purpose: tracking pixels cost inbox placement.',
+    ruleCheck('learn_from_results', 'Show the Writer how earlier campaigns did', v) +
+    '<div class="rule-row"><label>Count a campaign once it has <input class="form-input" type="number" min="5" max="10000" id="rule-learn_min_sent" value="' + escHtml(String(v.learn_min_sent)) + '"> first emails sent</label></div>');
+  html += ruleSection('Which campaign brought a visit',
+    'Adds <code>?ref=h-…</code> to links that point at your own site, so your site\'s visitor statistics show which campaign each visit came from. ' +
+    'The link still goes straight to your site: nothing is redirected, so inbox placement is not hurt.',
+    ruleCheck('tag_links', 'Tag links to my own site with the campaign', v));
+  html += '<div style="margin-top:16px"><button class="btn btn-primary" onclick="saveRules()">Save campaign rules</button> ' +
+    '<button class="btn btn-secondary" onclick="rulesRecommended()">Fill in recommended</button></div></div></div>';
+  el.innerHTML = html;
+  rulesDelays(delays);
+  rulesToggle();
+}
+function rulesDelays(delays) {
+  const steps = parseInt(document.getElementById('rule-sequence_steps').value, 10);
+  const use = (delays && delays.length === steps - 1) ? delays : _rules.built_in.delays[String(steps)];
+  document.getElementById('rule-delays').innerHTML = use.map((d, i) =>
+    '<label>Email ' + (i + 2) + ' after <input class="form-input rule-delay" type="number" min="1" max="30" value="' + d + '" oninput="rulesSpan()"> days</label>').join('');
+  rulesSpan();
+}
+function rulesSteps() { rulesDelays(null); }
+function rulesSpan() {
+  const days = [...document.querySelectorAll('.rule-delay')].reduce((t, e) => t + (parseInt(e.value, 10) || 0), 0);
+  const n = document.querySelectorAll('.rule-delay').length + 1;
+  document.getElementById('rule-span').textContent = n + ' emails over ' + days + ' days.';
+}
+function rulesToggle() {
+  const on = document.getElementById('rule-send_window_on').checked;
+  document.getElementById('rule-window-fields').style.opacity = on ? '1' : '.5';
+}
+function rulesRecommended() {
+  drawRules(_rules, _rules.recommended);
+  showToast('Recommended values filled in. Press Save to apply.', 'success');
+}
+async function saveRules() {
+  const val = k => document.getElementById('rule-' + k);
+  const body = {
+    send_window_on: val('send_window_on').checked, send_start: val('send_start').value, send_end: val('send_end').value,
+    weekdays_only: val('weekdays_only').checked, recipient_timezone: val('recipient_timezone').checked,
+    sequence_steps: parseInt(val('sequence_steps').value, 10),
+    sequence_delays: [...document.querySelectorAll('.rule-delay')].map(e => parseInt(e.value, 10)),
+    ab_test: val('ab_test').checked, ab_min_prospects: parseInt(val('ab_min_prospects').value, 10),
+    ab_angle_a: val('ab_angle_a').value, ab_angle_b: val('ab_angle_b').value,
+    learn_from_results: val('learn_from_results').checked, learn_min_sent: parseInt(val('learn_min_sent').value, 10),
+    tag_links: val('tag_links').checked,
+  };
+  const data = await api('/api/campaign-rules', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+  });
+  showToast(data && data.success ? 'Saved. New campaigns follow these rules.'
+                                  : (data && data.message) || 'Could not save.', data && data.success ? 'success' : 'error');
+  if (data && data.success) loadRules();
+}
+
 async function loadSettings() {
   loadBusiness();
+  loadKnowledge();
+  loadRules();
   const data = await api('/api/settings');
   if (!data) return;
 
@@ -2791,12 +2922,19 @@ async function loadCampaigns() {
         '</div></div>';
     });
     const pc = (c.prospect_ids || []).length;
+    const nums = c.numbers || {sent: 0, replies: 0, interested: 0};
+    const rate = nums.sent ? Math.round(nums.replies / nums.sent * 1000) / 10 : 0;
+    const results = '<div class="meta campaign-results">' +
+      (c.variant ? '<span class="mini t-waiting" title="' + escHtml(c.angle || '') + '">Test group ' + escHtml(c.variant) + '</span>' : '') +
+      '<span>' + nums.sent + ' first email' + (nums.sent !== 1 ? 's' : '') + ' sent</span>' +
+      '<span>' + nums.replies + ' repl' + (nums.replies !== 1 ? 'ies' : 'y') + (nums.sent ? ' (' + rate + '%)' : '') + '</span>' +
+      '<span>' + nums.interested + ' interested</span></div>';
     html += '<div class="campaign-card"><div class="campaign-top">' +
       '<div class="campaign-title"><h3>' + escHtml(c.name || 'Untitled Campaign') + '</h3>' +
         '<button class="btn btn-ghost btn-sm" onclick="fbCampaign(' + i + ')">Feedback</button></div>' +
       '<div class="meta">' + badge(c.status) + '<span>' + pc + ' prospect' + (pc !== 1 ? 's' : '') + '</span>' +
         '<span>' + (c.sequence || []).length + ' emails</span><span>Created ' + relTime(c.created_at) + '</span></div>' +
-      campaignProgress(c) + '</div>' +
+      results + campaignProgress(c) + '</div>' +
       '<div class="sequence">' +
       (stepsHtml || '<p class="muted" style="font-size:13px;padding-top:16px">No email steps in this campaign.</p>') + '</div></div>';
   });

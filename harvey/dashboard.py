@@ -396,6 +396,59 @@ async def business_save(request: Request):
     return {"success": True, "file": path.name, "profile": business_profile()}
 
 
+@app.get("/api/campaign-rules")
+async def campaign_rules_get():
+    """When to send, how many emails, A/B testing, learning, link tags."""
+    from harvey.config import campaign_rules
+    from harvey.agents.writer import AB_ANGLE_A, AB_ANGLE_B, DEFAULT_DELAYS
+    rules = campaign_rules()
+    rules["built_in"] = {"ab_angle_a": AB_ANGLE_A, "ab_angle_b": AB_ANGLE_B,
+                         "delays": {str(k): v for k, v in DEFAULT_DELAYS.items()}}
+    return rules
+
+
+@app.post("/api/campaign-rules")
+async def campaign_rules_save(request: Request):
+    from harvey.config import ConfigError, campaign_rules, set_campaign_rules
+    try:
+        data = await request.json()
+    except Exception:
+        data = None
+    try:
+        path = set_campaign_rules(data)
+    except ConfigError as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=400)
+    except OSError as e:
+        logger.warning("Could not write the campaign rules: %s", e)
+        return JSONResponse({"success": False, "message": "Could not write the settings file."},
+                            status_code=500)
+    return {"success": True, "file": path.name, "rules": campaign_rules()}
+
+
+@app.get("/api/product-knowledge")
+async def product_knowledge_get():
+    from harvey.config import MAX_PRODUCT_KNOWLEDGE_CHARS, product_knowledge
+    return {"text": product_knowledge(), "max": MAX_PRODUCT_KNOWLEDGE_CHARS}
+
+
+@app.post("/api/product-knowledge")
+async def product_knowledge_save(request: Request):
+    from harvey.config import ConfigError, set_product_knowledge
+    try:
+        data = await request.json()
+    except Exception:
+        data = None
+    try:
+        set_product_knowledge((data or {}).get("text") if isinstance(data, dict) else None)
+    except ConfigError as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=400)
+    except OSError as e:
+        logger.warning("Could not write product knowledge: %s", e)
+        return JSONResponse({"success": False, "message": "Could not write the file."},
+                            status_code=500)
+    return {"success": True}
+
+
 @app.get("/api/settings")
 async def get_settings():
     """Get current settings — presence flags only for secrets, never raw values."""
@@ -2206,7 +2259,30 @@ async def get_campaigns():
     footer = _compliance_view()["footer"]
     committed = await _harvey_committed_ids()
     hand_sent = await _hand_sent_ids()
+    numbers, variants = {}, {}
+    try:
+        for r in await query_db(
+                "SELECT campaign_id AS id, COUNT(*) AS n FROM outbox WHERE status = 'sent' AND step = 1 "
+                "AND kind = 'sequence' AND campaign_id != '' GROUP BY campaign_id"):
+            numbers[r["id"]] = {"sent": r["n"], "replies": 0, "interested": 0}
+        for r in await query_db(
+                "SELECT campaign_id AS id, COUNT(DISTINCT prospect_id) AS n, "
+                "COUNT(DISTINCT CASE WHEN intent = 'interested' THEN prospect_id END) AS good "
+                "FROM conversations WHERE campaign_id != '' AND intent != '' GROUP BY campaign_id"):
+            numbers.setdefault(r["id"], {"sent": 0, "replies": 0, "interested": 0}).update(
+                replies=r["n"], interested=r["good"] or 0)
+        for r in await query_db("SELECT key, value FROM settings WHERE key LIKE 'campaign_variant:%'"):
+            try:
+                variants[r["key"].split(":", 1)[1]] = json.loads(r["value"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+    except Exception as e:
+        logger.warning("Could not read campaign numbers: %s", e)
     for row in rows:
+        row["numbers"] = numbers.get(row["id"], {"sent": 0, "replies": 0, "interested": 0})
+        variant = variants.get(row["id"]) or {}
+        row["variant"] = str(variant.get("variant") or "") if isinstance(variant, dict) else ""
+        row["angle"] = str(variant.get("angle") or "") if isinstance(variant, dict) else ""
         try:
             row["sequence"] = json.loads(row.get("sequence_json", "[]"))
         except (json.JSONDecodeError, TypeError):
