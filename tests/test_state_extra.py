@@ -307,3 +307,54 @@ async def test_campaign_stats_zero_prospects_no_division_error(state):
     await state.add_campaign(Campaign(id="", name="Empty", status="active"))
     stats = await state.get_campaign_stats()
     assert stats[0]["reply_rate"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_half_applied_upgrade_finishes_instead_of_failing_forever(tmp_path):
+    """An older version could add a column and stop before recording the step.
+    The next start must finish that step, not fail on the existing column."""
+    import sqlite3
+    from harvey.state import MIGRATIONS
+    path = tmp_path / "half.db"
+    with sqlite3.connect(path) as db:
+        for script in MIGRATIONS[:3]:
+            db.executescript(script)
+        db.execute("ALTER TABLE prospects ADD COLUMN email_status TEXT DEFAULT ''")
+        db.execute("PRAGMA user_version = 3")
+    sm = StateManager(db_path=str(path))
+    await sm.init_db()
+    with sqlite3.connect(path) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == len(MIGRATIONS)
+        assert db.execute("SELECT count(*) FROM email_patterns").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_failing_step_leaves_nothing_behind(tmp_path, monkeypatch):
+    import sqlite3
+    import harvey.state as st
+    path = tmp_path / "bad.db"
+    sm = StateManager(db_path=str(path))
+    await sm.init_db()
+    bad = "CREATE TABLE half_made (id TEXT);\nINSERT INTO no_such_table VALUES (1);"
+    monkeypatch.setattr(st, "MIGRATIONS", st.MIGRATIONS + [bad])
+    with pytest.raises(sqlite3.OperationalError):
+        await sm.init_db()
+    with sqlite3.connect(path) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == len(st.MIGRATIONS) - 1
+        assert db.execute("SELECT count(*) FROM sqlite_master WHERE name='half_made'").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_two_starts_at_once_both_succeed(tmp_path):
+    import asyncio
+    path = str(tmp_path / "race.db")
+    await asyncio.gather(*(StateManager(db_path=path).init_db() for _ in range(6)))
+
+
+def test_scripts_split_into_whole_statements():
+    from harvey.state import MIGRATIONS, _statements
+    for script in MIGRATIONS:
+        for statement in _statements(script):
+            assert statement
+    trigger = [x for sc in MIGRATIONS for x in _statements(sc) if "CREATE TRIGGER" in x.upper()]
+    assert trigger and all(x.rstrip().upper().endswith("END;") for x in trigger)
