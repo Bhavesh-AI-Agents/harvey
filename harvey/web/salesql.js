@@ -180,7 +180,7 @@ async function sqDescribe() {
   const text = (SQ.describe || '').trim();
   if (SQ.busy) return;
   if (text.length < 8) { showToast('Describe who you want to find in a sentence or two.', 'error'); return; }
-  if (SQ.dirty && !confirm('Replace the filters you have changed but not saved?')) return;
+  if (SQ.dirty && !confirm('Leave the changes you have not saved?')) return;
   SQ.busy = 'describe';
   SQ.describeNote = 'Usually under a minute. A model running on your own machine can take a few minutes.';
   sqRender();
@@ -192,8 +192,12 @@ async function sqDescribe() {
     sqRender();
     return;
   }
+  // A description starts a new audience with its own, empty list. The audience
+  // that was open stays as it was, with the people it found.
   SQ.aud = data.audience;
+  SQ.audId = '';
   SQ.dirty = true;
+  SQ.picks = new Set(); SQ.tab = 'qualified';
   SQ.notes = data.notes || [];
   // Open every part the description filled in, so it can be checked at a glance.
   SQ.open = new Set(SQ_FIELDS.filter(f => data.audience[f.key].include.length || data.audience[f.key].exclude.length)
@@ -202,9 +206,9 @@ async function sqDescribe() {
   if (data.audience.staff.length) SQ.open.add('staff');
   if (SQ_FLAGS.some(([k]) => data.audience[k]) ||
       SQ_RANGES.some(([k]) => data.audience[k].min !== null || data.audience[k].max !== null)) SQ.open.add('more');
-  SQ.describeNote = 'Filters set from your description. Check them, then press Save and search.';
+  SQ.describeNote = 'A new audience was made from your description. Check its filters, then press Save and search.';
   sqRender();
-  showToast('Filters set. Check them, then press Save and search.', 'success');
+  showToast('New audience made from your description. Check its filters, then press Save and search.', 'success');
 }
 
 // ── Audience panel ──
@@ -392,7 +396,9 @@ function sqSaveBar() {
 // ── Audience edits ──
 
 function sqTouch() {
+  const was = SQ.dirty;
   SQ.dirty = true;
+  if (!was && SQ.audId) sqRenderResults();
   const bar = sqEl('sq-save');
   if (bar) bar.innerHTML = sqSaveBar();
   const head = sqEl('sq-search-btn');
@@ -532,7 +538,7 @@ async function sqSave(asNew) {
   SQ.busy = 'save';
   const body = {audience: SQ.aud};
   if (!asNew && SQ.audId) body.id = SQ.audId;
-  if (asNew) {
+  if (asNew || !SQ.audId) {      // a new audience never takes another one's name
     const taken = ((SQ.data.audiences || {}).items || []).map(i => i.name.toLowerCase());
     let name = SQ.aud.name, n = 2;
     while (taken.includes(name.toLowerCase())) name = SQ.aud.name + ' ' + n++;
@@ -615,6 +621,11 @@ function sqResults() {
     'brings its next ' + (SQ.aud.page_size || 100) + ' people. Each audience keeps its own list.</p></div>' +
     '<button class="btn btn-primary" id="sq-search-btn" onclick="sqSearch()"' + (SQ.busy ? ' disabled' : '') + '>' +
     sqSearchLabel() + '</button></div>';
+  if (SQ.audId && SQ.dirty && (SQ.data.candidates || []).length) {
+    html += '<div class="banner wait" style="margin-bottom:10px"><div><p style="margin:0">You have changed this audience. ' +
+      'The people below were found with the filters as last saved. Press <b>Save and search</b>: new people follow the new ' +
+      'filters, and anyone here who no longer fits moves out of Qualified.</p></div></div>';
+  }
   html += '<div class="sq-tabs" role="tablist">' + SQ_TABS.map(([key, label]) =>
     '<button class="sq-tab' + (key === SQ.tab ? ' on' : '') + '" role="tab" aria-selected="' + (key === SQ.tab) +
     '" onclick="sqTab(\'' + key + '\')">' + label + ' <span class="sq-tab-n">' + sqRows(key).length + '</span></button>').join('') + '</div>';
