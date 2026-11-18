@@ -258,6 +258,11 @@ def clean_rules(data) -> list[dict]:
             else:
                 value = _words(value, f"Rule {n}, job titles")
             rule.update(filter=name, value=value)
+        elif kind == "main_position":
+            # SalesQL matches a filter against ANY job a person holds, and
+            # shows their main one. This checks the main one.
+            for key in ("titles_any", "industries_any", "industries_none"):
+                rule[key] = _words(raw[key], f"Rule {n}, {key}") if raw.get(key) else []
         elif kind == "lookup":
             if raw.get("field") not in LOOKUP_FIELDS or raw.get("mode") not in ("include", "exclude"):
                 raise ValueError(f"Rule {n}: unknown list or mode.")
@@ -311,6 +316,8 @@ def describe_rule(rule: dict) -> str:
         who = "nobody" if rule["mode"] == "none" else "at least one person"
         return (f"The company must have {who} with a {rule['label']} job title "
                 f"({', '.join(rule['titles'])}).")
+    if rule["kind"] == "main_position":
+        return "The job and company SalesQL shows for the person must match, not another job they hold."
     if rule["kind"] == "lookup":
         verb = "Only" if rule["mode"] == "include" else "Leave out"
         return f"{verb} these {LOOKUP_FIELDS[rule['field']][2]} values: {', '.join(rule['names'])}."
@@ -369,6 +376,19 @@ def grade_by_rules(person: dict, rules: list[dict], *, allowed_sizes,
     if allowed_sizes and person.get("org_size") and person["org_size"] not in allowed_sizes:
         return "unsure", (f"Their main company is {person['org_size']} people, outside the "
                           "size you asked for.")
+    for rule in rules:
+        if rule["kind"] != "main_position":
+            continue
+        title, industry = person.get("title", ""), _s(person.get("org_industry"))
+        if industry and industry.lower() in {v.lower() for v in rule["industries_none"]}:
+            return "rejected", f"Their main company is in {industry}, which you excluded."
+        if rule["titles_any"] and not technical_word(title, rule["titles_any"]):
+            return "unsure", (f"Their main job title is \"{title or 'unknown'}\", which has none of "
+                              "your titles. SalesQL matched another job they hold.")
+        if rule["industries_any"] and industry \
+                and industry.lower() not in {v.lower() for v in rule["industries_any"]}:
+            return "unsure", (f"Their main company is in {industry}, not an industry you "
+                              "included. SalesQL matched another company they work with.")
     passed: list[str] = []
     unsure = ""
     for rule in rules:
@@ -519,6 +539,8 @@ def audience_to_engine(aud: dict) -> tuple[dict, list[dict]]:
         if aud["company_types"][side]:
             add(("" if side == "include" else "x-") + "types", kind="lookup",
                 field="company_types", mode=side, names=aud["company_types"][side])
+    add("main", kind="main_position", titles_any=aud["job_titles"]["include"],
+        industries_any=aud["industries"]["include"], industries_none=aud["industries"]["exclude"])
     for n, check in enumerate(aud["staff"], start=1):
         add(f"staff-{n}", kind="company_staff", mode=check["must"], label=check["label"],
             titles=check["titles"])
@@ -558,6 +580,8 @@ async def audience_from_legacy(state, config) -> dict:
             if target:
                 side = "include" if rule["mode"] == "has_any" else "exclude"
                 aud[target][side] = list(dict.fromkeys(aud[target][side] + rule["words"]))
+        elif rule["kind"] == "main_position":
+            continue
         elif rule["kind"] == "lookup":
             aud[rule["field"]][rule["mode"]] = list(dict.fromkeys(
                 aud[rule["field"]][rule["mode"]] + rule["names"]))
@@ -987,6 +1011,24 @@ async def search(state, config, api_key: str, *, transport=None) -> dict:
         if await state.upsert_salesql_candidate(p):
             summary["new"] += 1
         summary[grade] += 1
+    # People from earlier searches are held to the audience as it is now, as
+    # far as that needs no new lookup: someone a changed or stricter audience
+    # no longer fits should not stay under Qualified.
+    # Only with a single audience: people are not tagged with the audience
+    # that found them, so with several this would judge one audience's
+    # people by another's rules.
+    seen = {p["id"] for p in people}
+    moved = 0
+    single = len((await _audiences(state))["items"]) <= 1
+    for row in (await state.get_salesql_candidates(status="found")) if single else []:
+        if row["id"] in seen or row["grade"] != "qualified":
+            continue
+        grade, reason = grade_by_rules(row, rules, allowed_sizes=sizes, staff={})
+        if grade != "qualified":
+            await state.update_salesql_candidate(row["id"], grade=grade, reason=reason)
+            moved += 1
+    if moved:
+        notes.append(f"{moved} found earlier no longer fit this audience and left Qualified.")
     await state.log_action("salesql_search", "scout", {
         k: summary[k] for k in ("found", "new", "qualified", "unsure", "rejected")})
     return summary
