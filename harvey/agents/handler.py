@@ -1025,6 +1025,7 @@ class Handler:
                             "thread_ref": msg.thread_ref,
                             "message_id": msg.message_id,
                             "subject": msg.subject,
+                            "mailbox": getattr(msg, "mailbox", ""),
                         },
                     )
                 handled += 1
@@ -1115,6 +1116,17 @@ class Handler:
         if subject and not subject.lower().startswith("re:"):
             subject = f"Re: {subject}"
 
+        # With several sending mailboxes, the answer comes from the mailbox
+        # the person wrote to (the thread lives there), signed by its sender.
+        from_address = ""
+        if getattr(self.provider, "is_pool", False):
+            from harvey import mailboxes
+            from_address = (reply_meta.get("mailbox", "")
+                            or await self.state.prospect_mailbox(prospect.id))
+            box = mailboxes.get(from_address) if from_address else None
+            if box is not None:
+                response = mailboxes.resign(response, self.config.persona.name, box)
+
         item_id = await self.state.add_outbox_item(
             prospect_id=prospect.id,
             conversation_id=convo.id,
@@ -1122,6 +1134,7 @@ class Handler:
             to_email=prospect.email,
             subject=subject or "Re: your note",
             body=response,
+            from_address=from_address,
             send_at=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
             status="pending_review" if require_approval else "approved",
             provider=self.provider.name if self.provider else "",

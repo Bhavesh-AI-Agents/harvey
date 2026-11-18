@@ -715,6 +715,19 @@ your explicit choice.
 
 *None of this is legal advice. Sending at scale or into regulated industries? Talk to a lawyer.*
 
+### Sending from several mailboxes
+
+One mailbox can only send so much cold email a day before it starts landing in spam, so volume comes from more mailboxes, not from pushing one harder. With Gmail or Google Workspace, Harvey can send from a list of mailboxes, managed on the dashboard under **Settings > Sending mailboxes**. No file editing, and nothing to restart.
+
+- **Add a mailbox.** Enter the address, the real person who sends from it, and a daily limit, then sign in with Google in the same tab. Harvey checks that you signed in as that mailbox. Your Google OAuth client must list the dashboard's own address as a redirect address; the card shows the exact value. For a dashboard on your own machine that is `http://127.0.0.1:5555/`; behind a proxy it is the public address.
+- **One mailbox per person.** The mailbox is chosen when someone's first email is queued, in proportion to each mailbox's daily limit. Every follow-up and reply uses the same one, and a reply is answered from the mailbox it arrived in. The Outbox shows which mailbox each draft goes out from.
+- **Signed by the sender.** Emails are written signed with the persona's name. When another person's mailbox sends one, only that closing name is swapped for theirs, at queue time, so you approve what goes out.
+- **Its own limit and ramp.** Each mailbox has a daily limit and a warmup start date. The ramp's shape comes from `channels.email.warmup` (`min_days`, `start_sends`, `daily_increase`); the start date is per mailbox and defaults to the day you add it. Clear the date to use the full limit at once.
+- **Off means waiting.** A mailbox that is switched off, signed out or at today's limit sends nothing, and its email waits. It is never moved to another mailbox, because that would change who a person hears from. A mailbox can't be removed while email is queued for it.
+- **Warmup per mailbox.** With TrulyInbox connected, the list shows TrulyInbox's view of each mailbox.
+
+The list lives in `data/mailboxes.json` and each sign-in in `data/gmail_tokens/`, both readable by you only. With no list, nothing changes: Harvey sends from the one mailbox in `persona.email`. Still shared across mailboxes: the bounce-rate kill switch, *Pause all sending* and the opt-out list.
+
 ### Finding people with SalesQL
 
 Harvey's own prospecting starts from companies and reads their websites. When you would rather start from people (a job title, an industry, a company size, a country), connect [SalesQL](https://salesql.com), a B2B contact database. Harvey's own code talks to SalesQL's MCP server; the writing model never sees the connection and keeps running with no tools.

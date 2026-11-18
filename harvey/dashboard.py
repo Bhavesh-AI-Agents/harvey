@@ -490,6 +490,267 @@ async def trulyinbox_other():
     return {"success": True}
 
 
+# ── Sending mailboxes: add, sign in, limit, switch off (harvey/mailboxes.py) ──
+
+# Google sign-ins started from this dashboard and not finished yet:
+# state -> (address, redirect address, expiry). Single use, ten minutes.
+_oauth_pending: dict[str, tuple[str, str, float]] = {}
+_OAUTH_TTL = 600
+_warmup_cache: dict[str, tuple[float, dict | None]] = {}
+_WARMUP_TTL = 600
+
+
+def _gmail_client() -> tuple[str, str]:
+    env_vars = _read_env_file()
+    return ((env_vars.get("GMAIL_CLIENT_ID", "") or os.getenv("GMAIL_CLIENT_ID", "")).strip(),
+            (env_vars.get("GMAIL_CLIENT_SECRET", "") or os.getenv("GMAIL_CLIENT_SECRET", "")).strip())
+
+
+def _oauth_redirect(request: Request) -> str:
+    """Where Google sends the browser back: this dashboard's own front page."""
+    pub = auth.public_origin()
+    if pub is not None:
+        return pub[0] + BASE_PATH + "/"
+    return f"http://{request.headers.get('host', '127.0.0.1:5555')}{BASE_PATH}/"
+
+
+async def _mailbox_warmup(address: str) -> dict | None:
+    """TrulyInbox's view of one mailbox, or None when it isn't connected."""
+    import time as _time
+    from harvey import deliverability as d
+    from harvey.integrations import trulyinbox as ti
+    cached = _warmup_cache.get(address)
+    if cached and _time.time() - cached[0] < _WARMUP_TTL:
+        return cached[1]
+    health, error = await ti.current_health(address)
+    if health is None and not error:
+        out = None
+    else:
+        check = d.check_warmup_service(health, None, error=error)
+        out = {"status": check.status, "detail": check.detail,
+               "started_on": health.started_on.isoformat()
+               if health is not None and health.started_on else ""}
+    _warmup_cache[address] = (_time.time(), out)
+    return out
+
+
+@app.get("/api/mailboxes")
+async def mailboxes_list(request: Request):
+    """The sending list with each mailbox's sign-in, limits and today's use."""
+    from datetime import datetime, timezone
+
+    from harvey import mailboxes as mb
+    from harvey.integrations import gmail
+    out = {"provider": "", "gmail_ready": all(_gmail_client()),
+           "redirect_uri": _oauth_redirect(request), "mailboxes": [], "error": "",
+           "persona_email": "", "max": mb.MAX_DAILY_LIMIT}
+    email_config = None
+    try:
+        from harvey.config import load_config
+        config = load_config()
+        email_config = config.channels.email
+        out["provider"] = (email_config.provider or "").strip().lower()
+        out["persona_email"] = config.persona.email or ""
+    except Exception:
+        out["error"] = "harvey.yaml couldn't be read."
+    state = _state()
+    await state.init_db()
+    midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    sent = await state.mailbox_sent_today(
+        midnight.astimezone(timezone.utc).replace(tzinfo=None).isoformat())
+    queued = await state.mailbox_open_counts()
+    for box in mb.load():
+        signed_in = gmail._load_token(mb.token_path(box.address)) is not None
+        total, cold = sent.get(box.address, (0, 0))
+        out["mailboxes"].append({
+            "address": box.address, "name": box.name, "daily_limit": box.daily_limit,
+            "enabled": box.enabled, "warmup_start": box.warmup_start, "signed_in": signed_in,
+            "sent_today": total, "cold_sent_today": cold, "queued": queued.get(box.address, 0),
+            "cold_cap_today": mb.cold_cap(box, email_config) if email_config is not None
+            else box.daily_limit,
+            "warmup": await _mailbox_warmup(box.address),
+        })
+    return out
+
+
+def _mailbox_fields(data) -> dict:
+    """The editable fields present in a request body, type-checked."""
+    from harvey import mailboxes as mb
+    if not isinstance(data, dict):
+        raise mb.MailboxError("Send the mailbox as JSON.")
+    out = {}
+    if "name" in data:
+        if not isinstance(data["name"], str):
+            raise mb.MailboxError("The sender name must be text.")
+        out["name"] = data["name"]
+    if "daily_limit" in data:
+        out["daily_limit"] = data["daily_limit"]
+    if "enabled" in data:
+        if not isinstance(data["enabled"], bool):
+            raise mb.MailboxError("'enabled' must be true or false.")
+        out["enabled"] = data["enabled"]
+    if "warmup_start" in data:
+        if data["warmup_start"] not in (None, "") and not isinstance(data["warmup_start"], str):
+            raise mb.MailboxError("The warmup start date must be YYYY-MM-DD.")
+        out["warmup_start"] = data["warmup_start"] or ""
+    return out
+
+
+def _start_sign_in(request: Request, address: str) -> str:
+    """A Google sign-in address for this mailbox, good for ten minutes."""
+    import secrets
+    import time as _time
+    from harvey.integrations import gmail
+    client_id, _ = _gmail_client()
+    now = _time.time()
+    for key in [k for k, v in _oauth_pending.items() if v[2] < now]:
+        del _oauth_pending[key]
+    if len(_oauth_pending) > 50:
+        _oauth_pending.clear()
+    state_token = secrets.token_urlsafe(32)
+    redirect = _oauth_redirect(request)
+    _oauth_pending[state_token] = (address, redirect, now + _OAUTH_TTL)
+    return gmail.web_auth_url(client_id, redirect, state_token, address)
+
+
+@app.post("/api/mailboxes")
+async def mailboxes_add(request: Request):
+    """Add a mailbox to the sending list and start its Google sign-in."""
+    from harvey import mailboxes as mb
+    try:
+        data = await request.json()
+    except Exception:
+        data = None
+    if not all(_gmail_client()):
+        return JSONResponse({"success": False, "message":
+                             "Add your Google OAuth client ID and secret first (below, "
+                             "under Gmail)."}, status_code=400)
+    try:
+        fields = _mailbox_fields(data)
+        async with _env_lock:
+            box = mb.add(data.get("address"), fields.get("name", ""),
+                         fields.get("daily_limit", 50), fields.get("warmup_start"))
+    except mb.MailboxError as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=400)
+    except OSError as e:
+        logger.warning("Failed to save the mailbox list: %s", e)
+        return JSONResponse({"success": False, "message": "Could not save the mailbox list."},
+                            status_code=500)
+    return {"success": True, "address": box.address,
+            "auth_url": _start_sign_in(request, box.address)}
+
+
+@app.post("/api/mailboxes/sign-in")
+async def mailboxes_sign_in(request: Request):
+    """Start (or redo) the Google sign-in of a mailbox already on the list."""
+    from harvey import mailboxes as mb
+    try:
+        data = await request.json()
+    except Exception:
+        data = None
+    address = data.get("address") if isinstance(data, dict) else None
+    box = mb.get(address) if isinstance(address, str) else None
+    if box is None:
+        return JSONResponse({"success": False, "message": "That mailbox isn't on the list."},
+                            status_code=400)
+    if not all(_gmail_client()):
+        return JSONResponse({"success": False, "message":
+                             "Add your Google OAuth client ID and secret first."}, status_code=400)
+    return {"success": True, "auth_url": _start_sign_in(request, box.address)}
+
+
+@app.post("/api/mailboxes/finish")
+async def mailboxes_finish(request: Request):
+    """Google sent the browser back with a code: check it and save the sign-in."""
+    import time as _time
+    from harvey import mailboxes as mb
+    from harvey.integrations import gmail
+    try:
+        data = await request.json()
+    except Exception:
+        data = None
+    code = data.get("code") if isinstance(data, dict) else None
+    state_token = data.get("state") if isinstance(data, dict) else None
+    if not isinstance(code, str) or not isinstance(state_token, str) \
+            or not 0 < len(code) <= 2048 or not 0 < len(state_token) <= 128:
+        return JSONResponse({"success": False, "message": "The sign-in didn't complete."},
+                            status_code=400)
+    pending = _oauth_pending.pop(state_token, None)
+    if pending is None or pending[2] < _time.time():
+        return JSONResponse({"success": False, "message":
+                             "That sign-in has expired. Start it again from Settings."},
+                            status_code=400)
+    address, redirect, _ = pending
+    if mb.get(address) is None:
+        return JSONResponse({"success": False, "message": "That mailbox isn't on the list."},
+                            status_code=400)
+    client_id, client_secret = _gmail_client()
+    ok, message = await gmail.finish_web_auth(
+        client_id, client_secret, code, redirect, address, mb.token_path(address))
+    if not ok:
+        return JSONResponse({"success": False, "message": message}, status_code=400)
+    state = _state()
+    await state.init_db()
+    await state.log_action("mailbox_signed_in", "dashboard", {"mailbox": address})
+    return {"success": True, "message": message}
+
+
+@app.post("/api/mailboxes/update")
+async def mailboxes_update(request: Request):
+    """Change a mailbox's sender name, daily limit, warmup date, or switch it on or off."""
+    from harvey import mailboxes as mb
+    try:
+        data = await request.json()
+    except Exception:
+        data = None
+    try:
+        fields = _mailbox_fields(data)
+        address = data.get("address")
+        if not isinstance(address, str):
+            raise mb.MailboxError("Say which mailbox.")
+        async with _env_lock:
+            box = mb.update(address, **fields)
+    except mb.MailboxError as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=400)
+    except OSError as e:
+        logger.warning("Failed to save the mailbox list: %s", e)
+        return JSONResponse({"success": False, "message": "Could not save the mailbox list."},
+                            status_code=500)
+    return {"success": True, "address": box.address}
+
+
+@app.post("/api/mailboxes/remove")
+async def mailboxes_remove(request: Request):
+    """Take a mailbox off the list and forget its sign-in. Refused while
+    email is queued for it: those people would otherwise change sender."""
+    from harvey import mailboxes as mb
+    try:
+        data = await request.json()
+    except Exception:
+        data = None
+    address = data.get("address") if isinstance(data, dict) else None
+    if not isinstance(address, str) or mb.get(address) is None:
+        return JSONResponse({"success": False, "message": "That mailbox isn't on the list."},
+                            status_code=400)
+    address = address.strip().lower()
+    state = _state()
+    await state.init_db()
+    queued = (await state.mailbox_open_counts()).get(address, 0)
+    if queued:
+        return JSONResponse({"success": False, "message":
+                             f"{queued} queued email(s) are waiting to go out from this mailbox. "
+                             "Switch it off instead, or reject them in the Outbox first."},
+                            status_code=409)
+    try:
+        async with _env_lock:
+            mb.remove(address)
+    except (mb.MailboxError, OSError) as e:
+        return JSONResponse({"success": False, "message": str(e)[:200]}, status_code=400)
+    _warmup_cache.pop(address, None)
+    await state.log_action("mailbox_removed", "dashboard", {"mailbox": address})
+    return {"success": True}
+
+
 # ── SalesQL: find people (free), reveal the ticked ones (one credit each) ──
 
 _salesql_lock = asyncio.Lock()

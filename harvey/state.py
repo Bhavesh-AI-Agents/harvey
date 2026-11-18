@@ -553,6 +553,14 @@ MIGRATIONS: list[str] = [
 
     CREATE INDEX IF NOT EXISTS idx_salesql_status ON salesql_candidates(status, grade);
     """,
+    # ── v16: which of several sending mailboxes an email goes out from ──
+    """
+    -- Empty with a single mailbox (persona.email), and for email queued
+    -- before a sending list existed. Set when a person's first email is
+    -- queued; their follow-ups and replies carry the same address.
+    ALTER TABLE outbox ADD COLUMN from_address TEXT DEFAULT '';
+    CREATE INDEX IF NOT EXISTS idx_outbox_from ON outbox(from_address, status);
+    """,
 ]
 
 BRAIN_PROVIDERS = ("claude", "codex")
@@ -1044,6 +1052,7 @@ class StateManager:
         thread_ref: str = "",
         in_reply_to: str = "",
         approved_by: str = "",
+        from_address: str = "",
     ) -> str | None:
         """Queue one outgoing email. Returns its id, or None when the
         (campaign, prospect, step) slot already exists — the double-send guard.
@@ -1064,6 +1073,9 @@ class StateManager:
             )
             if cursor.rowcount > 0 and approved_by:
                 await db.execute("UPDATE outbox SET approved_by = ? WHERE id = ?", (approved_by, item_id))
+            if cursor.rowcount > 0 and from_address:
+                await db.execute("UPDATE outbox SET from_address = ? WHERE id = ?",
+                                 (_norm(from_address), item_id))
             await db.commit()
             return item_id if cursor.rowcount > 0 else None
 
@@ -1212,8 +1224,60 @@ class StateManager:
 
     _OUTBOX_COLUMNS = frozenset({
         "status", "error", "message_id", "thread_ref", "sent_at",
-        "subject", "body", "send_at", "provider",
+        "subject", "body", "send_at", "provider", "from_address",
     })
+
+    # ── Several sending mailboxes (harvey/mailboxes.py) ──
+
+    async def prospect_mailbox(self, prospect_id: str) -> str:
+        """The mailbox this person already hears from, or "". Their latest
+        email decides, so a follow-up or reply never switches sender."""
+        if not prospect_id:
+            return ""
+        async with self._connect() as db:
+            async with db.execute(
+                """SELECT from_address FROM outbox
+                   WHERE prospect_id = ? AND from_address != ''
+                     AND status NOT IN ('cancelled', 'rejected')
+                   ORDER BY COALESCE(sent_at, created_at) DESC, created_at DESC LIMIT 1""",
+                (prospect_id,),
+            ) as cur:
+                row = await cur.fetchone()
+                return row[0] if row else ""
+
+    async def mailbox_open_counts(self) -> dict[str, int]:
+        """Email queued and not yet sent, per mailbox."""
+        async with self._connect() as db:
+            async with db.execute(
+                """SELECT from_address, COUNT(*) FROM outbox
+                   WHERE from_address != '' AND status IN ('pending_review', 'approved', 'sending')
+                   GROUP BY from_address""") as cur:
+                return {r[0]: r[1] for r in await cur.fetchall()}
+
+    async def mailbox_sent_today(self, cold_since: str) -> dict[str, tuple[int, int]]:
+        """Per mailbox: (emails sent this UTC day, cold emails sent since
+        ``cold_since``, a naive UTC ISO time: local midnight, the day the
+        warmup ramp counts in)."""
+        async with self._connect() as db:
+            async with db.execute(
+                """SELECT from_address,
+                          SUM(CASE WHEN date(sent_at) = date('now') THEN 1 ELSE 0 END),
+                          SUM(CASE WHEN kind = 'sequence' AND sent_at >= ? THEN 1 ELSE 0 END)
+                   FROM outbox WHERE status = 'sent' AND from_address != ''
+                     AND sent_at >= datetime('now', '-2 days')
+                   GROUP BY from_address""", (cold_since,)) as cur:
+                return {r[0]: (r[1] or 0, r[2] or 0) for r in await cur.fetchall()}
+
+    async def assign_prospect_mailbox(self, prospect_id: str, address: str) -> int:
+        """Give this person's unsent email with no mailbox yet to ``address``."""
+        async with self._connect() as db:
+            cursor = await db.execute(
+                """UPDATE outbox SET from_address = ?, updated_at = ?
+                   WHERE prospect_id = ? AND from_address = ''
+                     AND status IN ('pending_review', 'approved')""",
+                (_norm(address), _utcnow().isoformat(), prospect_id))
+            await db.commit()
+            return cursor.rowcount
 
     async def update_outbox_item(self, item_id: str, **kwargs):
         fields = {k: v for k, v in kwargs.items() if k in self._OUTBOX_COLUMNS}

@@ -17,6 +17,7 @@ rest.
 import base64
 import codecs
 import json
+import os
 import logging
 import time
 import webbrowser
@@ -68,10 +69,11 @@ def _entry_id(entry, page: int) -> str:
 TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
 
 
-def _load_token() -> dict | None:
+def _load_token(path=None) -> dict | None:
+    path = path or TOKEN_FILE
     try:
-        if TOKEN_FILE.is_file():
-            data = json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
+        if path.is_file():
+            data = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(data, dict) and data.get("refresh_token"):
                 return data
     except (OSError, json.JSONDecodeError) as e:
@@ -79,11 +81,20 @@ def _load_token() -> dict | None:
     return None
 
 
-def _save_token(data: dict):
-    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    TOKEN_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+def _save_token(data: dict, path=None):
+    path = path or TOKEN_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        TOKEN_FILE.chmod(0o600)
+        path.parent.chmod(0o700) if path.parent.name == "gmail_tokens" else None
+    except OSError:
+        pass
+    # Created owner-only from the start, so the sign-in is never readable by
+    # other users, even for a moment.
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(json.dumps(data, indent=2))
+    try:
+        path.chmod(0o600)
     except OSError:
         pass
 
@@ -91,8 +102,14 @@ def _save_token(data: dict):
 class GmailProvider(MailProvider):
     name = "gmail"
 
-    def __init__(self, config, env):
+    def __init__(self, config, env, address: str = "", name: str = "", token_file=None):
         self.config = config
+        # One of several sending mailboxes (harvey/mailboxes.py) has its own
+        # address, sender name and sign-in. Without them this is the single
+        # mailbox in persona.email, as it always was.
+        self.address = address
+        self.sender_name = name
+        self._token_file = token_file
         self.client_id = getattr(env, "gmail_client_id", "")
         self.client_secret = getattr(env, "gmail_client_secret", "")
         self._access_token = ""
@@ -111,14 +128,18 @@ class GmailProvider(MailProvider):
         self._verify_week = False      # list the week once more after a full read
         self._pending: tuple | None = None
 
+    def _stored(self) -> dict | None:
+        """This mailbox's saved sign-in."""
+        return _load_token(self._token_file) if self._token_file else _load_token()
+
     def is_configured(self) -> bool:
-        return bool(self.client_id and self.client_secret and _load_token())
+        return bool(self.client_id and self.client_secret and self._stored())
 
     async def _token(self) -> str | None:
         """Valid access token, refreshing via the stored refresh token."""
         if self._access_token and time.time() < self._access_expires - 60:
             return self._access_token
-        stored = _load_token()
+        stored = self._stored()
         if not stored:
             self._token_problem = "not signed in to Gmail. Run 'harvey gmail auth'."
             logger.error("Gmail: " + self._token_problem)
@@ -222,7 +243,9 @@ class GmailProvider(MailProvider):
         msg = EmailMessage()
         persona = self.config.persona
         msg["To"] = to_email
-        msg["From"] = f"{persona.name} <{persona.email}>" if persona.email else persona.name
+        from_name = self.sender_name or persona.name
+        from_address = self.address or persona.email
+        msg["From"] = f"{from_name} <{from_address}>" if from_address else from_name
         msg["Subject"] = subject
         if in_reply_to:
             msg["In-Reply-To"] = in_reply_to
@@ -540,7 +563,7 @@ class GmailProvider(MailProvider):
     async def test_connection(self) -> tuple[bool, str]:
         if not self.client_id or not self.client_secret:
             return False, "GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET missing from .env"
-        if not _load_token():
+        if not self._stored():
             return False, "Not authorized yet — run 'harvey gmail auth'"
         data = await self._request("GET", "/profile")
         if data and data.get("emailAddress"):
@@ -632,3 +655,161 @@ def run_auth_flow(client_id: str, client_secret: str) -> bool:
     })
     print(f"  ✓ Gmail authorized. Token stored at {TOKEN_FILE}")
     return True
+
+
+# ── Several mailboxes ──
+
+class GmailPool(MailProvider):
+    """Every mailbox on the sending list (harvey/mailboxes.py), as one provider.
+
+    Sending names the mailbox (``from_address``); reading gathers replies
+    from all of them and notes which mailbox each one arrived in. A mailbox
+    that is switched off or not signed in sends nothing and is not read.
+    """
+
+    name = "gmail"
+    is_pool = True
+
+    def __init__(self, config, env):
+        self.config = config
+        self.env = env
+        self._providers: dict[tuple[str, str], GmailProvider] = {}
+        self._read_ok: list[GmailProvider] = []
+        # address -> why the last read of that mailbox failed
+        self.problems: dict[str, str] = {}
+
+    def boxes(self):
+        from harvey import mailboxes
+        return mailboxes.load()
+
+    def provider_for(self, box) -> GmailProvider:
+        from harvey import mailboxes
+        key = (box.address, box.name)
+        if key not in self._providers:
+            # A renamed mailbox gets a fresh provider; the old one is dropped.
+            for stale in [k for k in self._providers if k[0] == box.address]:
+                del self._providers[stale]
+            self._providers[key] = GmailProvider(
+                self.config, self.env, address=box.address, name=box.name,
+                token_file=mailboxes.token_path(box.address))
+        return self._providers[key]
+
+    def signed_in(self, box) -> bool:
+        return self.provider_for(box).is_configured()
+
+    def usable(self) -> list:
+        """Mailboxes that can send right now: switched on and signed in."""
+        return [b for b in self.boxes() if b.enabled and self.signed_in(b)]
+
+    def is_configured(self) -> bool:
+        return bool(self.usable())
+
+    async def send_email(self, to_email: str, subject: str, body: str, thread_ref: str = "",
+                         in_reply_to: str = "", from_address: str = "") -> SendResult:
+        box = next((b for b in self.usable() if b.address == (from_address or "").lower()), None)
+        if box is None:
+            return SendResult(ok=False, error=f"mailbox {from_address or '(none)'} is not available")
+        return await self.provider_for(box).send_email(
+            to_email, subject, body, thread_ref=thread_ref, in_reply_to=in_reply_to)
+
+    async def get_replies(self, limit: int = 500) -> list[InboundMessage]:
+        """Replies from every usable mailbox. One mailbox that can't be read
+        is skipped and reported in ``problems``; it never blocks the others."""
+        self._read_ok = []
+        self.problems = {}
+        out: list[InboundMessage] = []
+        for box in self.usable():
+            provider = self.provider_for(box)
+            try:
+                messages = await provider.get_replies(limit)
+            except Exception as e:
+                self.problems[box.address] = str(e)[:200]
+                logger.warning(f"Gmail: couldn't read {box.address}: {e}")
+                continue
+            for message in messages:
+                message.mailbox = box.address
+            out.extend(messages)
+            self._read_ok.append(provider)
+        return out
+
+    def confirm_read(self) -> None:
+        for provider in self._read_ok:
+            provider.confirm_read()
+        self._read_ok = []
+
+    async def test_connection(self) -> tuple[bool, str]:
+        boxes = self.boxes()
+        if not boxes:
+            return False, "No sending mailboxes yet. Add one on the dashboard (Settings)."
+        lines, all_ok = [], True
+        for box in boxes:
+            if not box.enabled:
+                lines.append(f"{box.address}: switched off")
+                continue
+            ok, detail = await self.provider_for(box).test_connection()
+            all_ok = all_ok and ok
+            lines.append(f"{box.address}: {detail}")
+        return all_ok, "; ".join(lines)
+
+
+# ── Signing a mailbox in from the dashboard ──
+#
+# The dashboard runs where Harvey runs, which may be a server the user only
+# reaches through a browser. So the round-trip ends at the dashboard's own
+# front page (the redirect address), which hands the code back to Harvey.
+
+def web_auth_url(client_id: str, redirect_uri: str, state: str, address: str = "") -> str:
+    import urllib.parse
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": SCOPE,
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": state,
+    }
+    if address:
+        params["login_hint"] = address
+    return AUTH_URL + "?" + urllib.parse.urlencode(params)
+
+
+async def finish_web_auth(client_id: str, client_secret: str, code: str, redirect_uri: str,
+                          address: str, token_file, *, transport=None) -> tuple[bool, str]:
+    """Exchange the code, check it is for the mailbox being added, save the
+    sign-in. Returns (ok, message for the user)."""
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT, transport=transport) as client:
+            resp = await client.post(TOKEN_URL, data={
+                "client_id": client_id, "client_secret": client_secret, "code": code,
+                "grant_type": "authorization_code", "redirect_uri": redirect_uri})
+            try:
+                data = resp.json()
+            except ValueError:
+                data = None
+            if resp.status_code != 200 or not isinstance(data, dict):
+                return False, ("Google refused the sign-in. Check that this address is listed "
+                               "as a redirect address on your Google OAuth client: " + redirect_uri)
+            access, refresh = data.get("access_token"), data.get("refresh_token")
+            if not isinstance(access, str) or not access:
+                return False, "Google's answer had no access token. Try again."
+            if not isinstance(refresh, str) or not refresh:
+                return False, ("Google returned no lasting sign-in. Remove Harvey from the "
+                               "account's third-party access list, then try again.")
+            prof = await client.get(API_BASE + "/profile",
+                                    headers={"Authorization": f"Bearer {access}"})
+            try:
+                signed_in_as = str(prof.json().get("emailAddress", "")).strip().lower()
+            except (ValueError, AttributeError):
+                signed_in_as = ""
+    except httpx.HTTPError:
+        return False, "Couldn't reach Google. Try again in a minute."
+    if not signed_in_as:
+        return False, ("Signed in, but Gmail wouldn't say which mailbox. Check that the Gmail "
+                       "API is enabled for your Google Cloud project.")
+    if signed_in_as != address:
+        return False, (f"You signed in as {signed_in_as}, not {address}. "
+                       "Sign in with the mailbox you are adding.")
+    _save_token({"refresh_token": refresh, "scope": data.get("scope", SCOPE),
+                 "obtained_at": int(time.time())}, token_file)
+    return True, f"{address} is signed in."
