@@ -6,6 +6,7 @@ columns), plus Harvey's own quality columns (score, email_status, signals)
 so a human can eyeball what they're getting.
 """
 
+import json
 import csv
 import io
 import logging
@@ -21,7 +22,7 @@ CSV_COLUMNS = [
     "email", "first_name", "last_name", "company_name", "title",
     "website", "linkedin_url", "industry", "personalization",
     "email_status", "score", "seniority", "source", "status", "created_at",
-    "phone",
+    "phone", "location", "headline", "other_emails", "other_phones",
 ]
 
 DEFAULT_EMAIL_STATUSES = ["verified", "risky"]
@@ -81,6 +82,15 @@ async def collect_prospects(
 
     out = []
     for r in rows:
+        try:
+            details = json.loads(r.get("details_json") or "{}")
+        except ValueError:
+            details = {}
+        details = details if isinstance(details, dict) else {}
+        other_emails = [f"{e.get('email')} ({e.get('kind')})" for e in details.get("emails") or []
+                        if isinstance(e, dict) and e.get("email") and e.get("email") != r.get("email")]
+        other_phones = [str(x.get("phone")) for x in details.get("phones") or []
+                        if isinstance(x, dict) and x.get("phone") and not x.get("shown_by_harvey")]
         out.append({
             "email": r.get("email", ""),
             "first_name": r.get("first_name", ""),
@@ -98,6 +108,10 @@ async def collect_prospects(
             "status": r.get("status", ""),
             "created_at": r.get("created_at", ""),
             "phone": r.get("phone", ""),
+            "location": details.get("location", ""),
+            "headline": details.get("headline", ""),
+            "other_emails": "; ".join(other_emails),
+            "other_phones": "; ".join(other_phones),
         })
     return out
 

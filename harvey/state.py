@@ -574,6 +574,16 @@ MIGRATIONS: list[str] = [
     ALTER TABLE salesql_candidates ADD COLUMN audience_id TEXT DEFAULT '';
     CREATE INDEX IF NOT EXISTS idx_salesql_audience ON salesql_candidates(audience_id, status);
     """,
+    # ── v19: keep everything a data source returned, not just what Harvey uses ──
+    """
+    -- A reveal is paid for, and returns more than one email and one phone.
+    -- details_json holds all of it for the contact: every email and phone
+    -- with its kind, the location, the headline, the company record and the
+    -- source's untouched reply. raw_json is the search result a candidate
+    -- came from. Harvey still emails only the one work address it chose.
+    ALTER TABLE prospects ADD COLUMN details_json TEXT DEFAULT '';
+    ALTER TABLE salesql_candidates ADD COLUMN raw_json TEXT DEFAULT '';
+    """,
 ]
 
 BRAIN_PROVIDERS = ("claude", "codex", "command")
@@ -1032,6 +1042,24 @@ class StateManager:
             ) as cursor:
                 row = await cursor.fetchone()
                 return self._prospect_from_row(row) if row else None
+
+    async def set_prospect_details(self, prospect_id: str, details: dict) -> None:
+        """Keep everything a source returned about this person (see v19)."""
+        async with self._connect() as db:
+            await db.execute("UPDATE prospects SET details_json = ? WHERE id = ?",
+                             (json.dumps(details, ensure_ascii=False), prospect_id))
+            await db.commit()
+
+    async def get_prospect_details(self, prospect_id: str) -> dict:
+        async with self._connect() as db:
+            async with db.execute("SELECT details_json FROM prospects WHERE id = ?",
+                                  (prospect_id,)) as cur:
+                row = await cur.fetchone()
+        try:
+            data = json.loads(row[0]) if row and row[0] else {}
+        except ValueError:
+            data = {}
+        return data if isinstance(data, dict) else {}
 
     async def update_prospect_email(
         self, prospect_id: str, email: str, email_status: str
@@ -2233,6 +2261,7 @@ class StateManager:
         "org_name", "org_domain", "org_industry", "org_size", "has_work_email",
         "has_verified_email", "grade", "reason", "dev_count",
         "audience_id",
+        "raw_json",
     )
 
     async def upsert_salesql_candidate(self, candidate: dict) -> bool:

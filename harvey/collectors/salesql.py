@@ -126,6 +126,8 @@ def candidate_from_result(result: dict) -> dict:
         "org_size": _size_label(org.get("number_of_employees")),
         "has_work_email": bool(work) or _int(result.get("n_work_emails")) > 0,
         "has_verified_email": any(e.get("verified") is True for e in work),
+        # What SalesQL returned for this person, untouched (contact data is masked in a search).
+        "raw_json": json.dumps(result, ensure_ascii=False)[:20000],
     }
 
 
@@ -1472,6 +1474,54 @@ def pick_phone(person: dict) -> tuple[str, bool]:
     return best
 
 
+def contact_details(person: dict, row: dict, chosen_email: str, chosen_phone: str) -> dict:
+    """Everything a reveal returned, in a shape other tools can read.
+
+    Harvey emails one work address and shows one phone, but the reveal was
+    paid for and returns more. All of it is kept: each email and phone with
+    its kind and whether SalesQL marks it valid, and the untouched reply.
+    Personal addresses are kept here for the record and are never emailed."""
+    emails = []
+    for e in person.get("emails") or []:
+        if not isinstance(e, dict) or "@" not in _s(e.get("email")):
+            continue
+        kind = _s(e.get("type")).upper()
+        address = _s(e.get("email")).lower()
+        emails.append({"email": address,
+                       "kind": "personal" if kind == "PE" else "work",
+                       "verified": e.get("verified") is True or _s(e.get("status")).lower() == "valid",
+                       "used_by_harvey": address == chosen_email})
+    phones = []
+    for entry in person.get("phones") or []:
+        if isinstance(entry, str):
+            entry = {"phone": entry}
+        if not isinstance(entry, dict):
+            continue
+        number = next((_s(entry.get(k)) for k in ("phone", "number", "phone_number", "value")
+                       if _s(entry.get(k))), "")
+        if not number:
+            continue
+        phones.append({"phone": number, "kind": _s(entry.get("type")).lower(),
+                       "country": _s(entry.get("country_code") or entry.get("country")),
+                       "verified": entry.get("is_valid") is True or entry.get("verified") is True
+                       or _s(entry.get("status")).lower() == "valid",
+                       "shown_by_harvey": bool(chosen_phone) and re.sub(r"\D", "", number)
+                       == re.sub(r"\D", "", chosen_phone)})
+    loc = _d(person.get("location"))
+    location = ", ".join(p for p in (_s(loc.get("city")), _s(loc.get("state")),
+                                     _s(loc.get("country"))) if p) or row.get("location", "")
+    return {
+        "source": COLLECTOR, "revealed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "linkedin_url": _s(person.get("linkedin_url")) or row.get("linkedin_url", ""),
+        "headline": _s(person.get("headline")) or row.get("headline", ""),
+        "location": location, "emails": emails, "phones": phones,
+        "company": {"name": row.get("org_name", ""), "domain": row.get("org_domain", ""),
+                    "industry": row.get("org_industry", ""), "size": row.get("org_size", ""),
+                    "salesql_id": row.get("org_uuid", "")},
+        "salesql_reply": person,
+    }
+
+
 def split_name(full_name: str) -> tuple[str, str]:
     """First and last name, dropping post-nominals after a comma ("Sam Lee, MBA")."""
     name = re.sub(r"\s+", " ", _s(full_name).split(",")[0])
@@ -1661,6 +1711,8 @@ async def _file_people(state, config, rows, people, summary, blocked, confirmed,
             source=COLLECTOR, source_url=row["linkedin_url"], score=70,
             personalization_notes="\n".join(notes), company=row["org_name"],
             industry=row["org_industry"], company_size=row["org_size"]))
+        await state.set_prospect_details(
+            prospect_id, contact_details(person, row, email, phone))
         await state.update_salesql_candidate(
             row["id"], status="revealed", prospect_id=prospect_id,
             note={"verified": "Address verified.", "risky": "Address is on a catch-all domain.",

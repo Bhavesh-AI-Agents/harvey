@@ -1661,6 +1661,15 @@ async def get_prospects():
         "WHERE action_type = 'opt_out_undone' AND json_valid(details_json)")}
     for r in rows:
         r["opt_out_undone"] = r.get("id") in undone
+        # Everything the source returned (other emails and phones, location);
+        # the source's untouched reply stays in the database and the export.
+        try:
+            details = json.loads(r.pop("details_json", "") or "{}")
+        except ValueError:
+            details = {}
+        details = details if isinstance(details, dict) else {}
+        details.pop("salesql_reply", None)
+        r["details"] = details
     return rows
 
 

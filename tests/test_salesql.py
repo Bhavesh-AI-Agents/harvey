@@ -336,6 +336,17 @@ async def test_revealing_makes_a_prospect_with_the_company_address(state):
     assert prospect.first_name == "Ada" and prospect.last_name == "Example"
     assert prospect.email_status == "verified" and prospect.status == "new"
     assert prospect.phone == "+1 555 0142" and prospect.phone_verified is True
+    kept = await state.get_prospect_details(prospect.id)
+    assert [e["email"] for e in kept["emails"]] == [
+        "p-ada@gmail.example", "p-ada@other.example", "p-ada@northvale.example"]     # every address
+    assert [(e["kind"], e["used_by_harvey"]) for e in kept["emails"]] == [
+        ("personal", False), ("work", False), ("work", True)]
+    assert [(x["phone"], x["shown_by_harvey"]) for x in kept["phones"]] == [
+        ("+1 555 0100", False), ("+1 555 0142", True)]                             # every number
+    assert kept["linkedin_url"] == "https://linkedin.com/in/p-ada" and kept["company"]["industry"]
+    assert kept["salesql_reply"]["uuid"] == "p-ada"                                # the untouched reply
+    found = (await state.get_salesql_candidates(ids=["p-ada"]))[0]
+    assert json.loads(found["raw_json"])["uuid"] == "p-ada"
     assert prospect.source == "salesql" and "No software job titles" in prospect.personalization_notes
     company = await state.get_company(prospect.company_id)
     assert company.domain == "northvale.example" and company.external_id == "salesql:o-1"
