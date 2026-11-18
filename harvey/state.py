@@ -519,6 +519,40 @@ MIGRATIONS: list[str] = [
     -- knows about the recipient. Empty until then.
     ALTER TABLE prospects ADD COLUMN timezone TEXT DEFAULT '';
     """,
+    # ── v15: people found through SalesQL, before any credit is spent ──
+    """
+    -- One row per person a SalesQL search returned. Contact data is still
+    -- hidden at this point: a person becomes a prospect only after a human
+    -- ticks the row and Harvey reveals the address (one SalesQL credit).
+    -- grade: qualified / unsure / rejected, with the reason shown to the user.
+    -- status: found / revealed / no_email / skipped / failed.
+    -- dev_count: people with a software title at the company; NULL = not checked.
+    CREATE TABLE IF NOT EXISTS salesql_candidates (
+        id TEXT PRIMARY KEY,
+        full_name TEXT DEFAULT '',
+        title TEXT DEFAULT '',
+        headline TEXT DEFAULT '',
+        linkedin_url TEXT DEFAULT '',
+        location TEXT DEFAULT '',
+        org_uuid TEXT DEFAULT '',
+        org_name TEXT DEFAULT '',
+        org_domain TEXT DEFAULT '',
+        org_industry TEXT DEFAULT '',
+        org_size TEXT DEFAULT '',
+        has_work_email INTEGER DEFAULT 0,
+        has_verified_email INTEGER DEFAULT 0,
+        grade TEXT DEFAULT 'unsure',
+        reason TEXT DEFAULT '',
+        dev_count INTEGER,
+        status TEXT DEFAULT 'found',
+        note TEXT DEFAULT '',
+        prospect_id TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_salesql_status ON salesql_candidates(status, grade);
+    """,
 ]
 
 BRAIN_PROVIDERS = ("claude", "codex")
@@ -2056,6 +2090,81 @@ class StateManager:
         except (json.JSONDecodeError, TypeError):
             return []
         return [l for l in known if isinstance(l, str)] if isinstance(known, list) else []
+
+    # ── SalesQL candidates ──
+
+    SALESQL_COLUMNS = (
+        "full_name", "title", "headline", "linkedin_url", "location", "org_uuid",
+        "org_name", "org_domain", "org_industry", "org_size", "has_work_email",
+        "has_verified_email", "grade", "reason", "dev_count",
+    )
+
+    async def upsert_salesql_candidate(self, candidate: dict) -> bool:
+        """Record a person a SalesQL search returned. Returns True when new.
+
+        A person already revealed, skipped or failed keeps that outcome: a
+        later search refreshes what SalesQL says about them and their grade,
+        never their status.
+        """
+        cid = str(candidate.get("id") or "").strip()
+        if not cid:
+            return False
+        values = []
+        for c in self.SALESQL_COLUMNS:
+            v = candidate.get(c)
+            if v is None and c != "dev_count":
+                v = 0 if c.startswith("has_") else ""
+            values.append(int(v) if isinstance(v, bool) else v)
+        cols = ", ".join(self.SALESQL_COLUMNS)
+        marks = ", ".join("?" for _ in self.SALESQL_COLUMNS)
+        updates = ", ".join(f"{c} = excluded.{c}" for c in self.SALESQL_COLUMNS)
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT 1 FROM salesql_candidates WHERE id = ?", (cid,)) as cur:
+                existed = await cur.fetchone() is not None
+            await db.execute(
+                f"""INSERT INTO salesql_candidates (id, {cols}) VALUES (?, {marks})
+                    ON CONFLICT(id) DO UPDATE SET {updates},
+                        updated_at = CURRENT_TIMESTAMP""",
+                (cid, *values),
+            )
+            await db.commit()
+        return not existed
+
+    async def get_salesql_candidates(
+        self, status: str | None = None, ids: list[str] | None = None, limit: int = 500,
+    ) -> list[dict]:
+        sql, params = "SELECT * FROM salesql_candidates", []
+        where = []
+        if status:
+            where.append("status = ?")
+            params.append(status)
+        if ids is not None:
+            if not ids:
+                return []
+            where.append("id IN (" + ",".join("?" for _ in ids) + ")")
+            params.extend(ids)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += (" ORDER BY CASE grade WHEN 'qualified' THEN 0 WHEN 'unsure' THEN 1 ELSE 2 END,"
+                " created_at DESC, id LIMIT ?")
+        params.append(int(limit))
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, params) as cur:
+                return [dict(r) for r in await cur.fetchall()]
+
+    async def update_salesql_candidate(self, candidate_id: str, **kwargs):
+        allowed = {"status", "note", "prospect_id", "grade", "reason", "dev_count"}
+        fields = {k: v for k, v in kwargs.items() if k in allowed}
+        if not fields:
+            return
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        async with self._connect() as db:
+            await db.execute(
+                f"UPDATE salesql_candidates SET {sets}, updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ?", (*fields.values(), candidate_id))
+            await db.commit()
 
     async def get_setting(self, key: str, default: str = "") -> str:
         async with self._connect() as db:

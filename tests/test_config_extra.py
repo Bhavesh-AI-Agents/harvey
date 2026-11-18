@@ -176,3 +176,18 @@ def test_load_env_reads_environment(monkeypatch):
 def test_env_config_rejects_non_string():
     with pytest.raises(ValidationError):
         EnvConfig(instantly_api_key=["not", "a", "string"])
+
+
+def test_salesql_settings_have_safe_defaults_and_bounds():
+    import pytest
+    from pydantic import ValidationError
+
+    from harvey.config import SalesQLConfig
+
+    cfg = SalesQLConfig()
+    assert cfg.max_reveals_per_day == 25 and cfg.require_no_developers and cfg.trust_verified
+    assert "engineer" in cfg.technical_words
+    for bad in ({"max_reveals_per_day": -1}, {"max_reveals_per_day": 5000},
+                {"page_size": 5}, {"page_size": 500}):
+        with pytest.raises(ValidationError):
+            SalesQLConfig(**bad)

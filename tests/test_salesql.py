@@ -1,0 +1,443 @@
+"""SalesQL: search is free, a reveal spends credits, and only for ticked people.
+
+Everything runs against a stand-in MCP server. All people and companies are
+invented and use reserved example domains.
+"""
+
+import json
+
+import httpx
+import pytest
+import pytest_asyncio
+
+from harvey.collectors import salesql as collector
+from harvey.config import HarveyConfig
+from harvey.integrations import salesql as sq
+from harvey.signals import seed_signal_catalog
+from harvey.state import StateManager
+
+KEY = "sq_test_key"
+US = "country-us"
+
+
+def make_config(**salesql):
+    return HarveyConfig(
+        persona={"name": "H", "company": "A", "role": "B", "email": "h@example.com",
+                 "linkedin": "", "tone": "t"},
+        product={"name": "P", "description": "D", "pricing": "$1", "key_benefits": [],
+                 "objection_responses": {}},
+        icp={"industries": ["Financial Services"], "company_size": "2-50",
+             "titles": ["Founder", "Owner"], "geography": ["US"]},
+        salesql=salesql,
+    )
+
+
+def person(uuid, name, title, org_uuid, org_name, domain, *, headline="", size="1 - 10",
+           emails=None):
+    return {
+        "uuid": uuid, "full_name": name, "title": title, "headline": headline or title,
+        "linkedin_url": f"https://linkedin.com/in/{uuid}",
+        "location": {"city": "Springfield", "state": "Ohio", "country": "United States"},
+        "organization": ({"uuid": org_uuid, "name": org_name, "website_domain": domain,
+                          "number_of_employees": size, "industry": "Financial Services"}
+                         if org_uuid else {"uuid": None, "name": org_name}),
+        "emails": emails if emails is not None
+        else [{"email": f"...@{domain}", "type": "BE", "verified": True}],
+        "n_work_emails": 1,
+    }
+
+
+PEOPLE = [
+    person("p-ada", "Ada Example", "Founder & CEO", "o-1", "Northvale Payments", "northvale.example"),
+    person("p-ben", "Ben Sample, MBA", "Owner", "o-2", "Lakeside Merchant Co", "lakeside.example"),
+    person("p-cal", "Cal Tester", "Founder & CTO", "o-3", "Hillside Pay", "hillside.example"),
+    person("p-dee", "Dee Placeholder", "Founder", None, "Stealth Venture", ""),
+    person("p-eve", "Eve Invented", "Owner", "o-5", "Bigger Co", "bigger.example", size="51 - 200"),
+]
+
+
+class FakeSalesQL:
+    """A stand-in MCP server: records every tool call it receives."""
+
+    def __init__(self, *, credits=50, developers=None, enrich=None, stream=False,
+                 status=200, dev_total=None):
+        self.calls: list[tuple[str, dict]] = []
+        self.credits = credits
+        self.developers = developers or []      # people results for the developer check
+        self.enrich = enrich
+        self.stream = stream
+        self.status = status
+        self.dev_total = dev_total
+
+    def tools(self, name):
+        return [args for tool, args in self.calls if tool == name]
+
+    def _result(self, name, args):
+        params = args.get("params", {})
+        if name == "get_account_status":
+            return {"plan": "Free", "credits": self.credits, "monthly_included": 50,
+                    "credits_refresh_date": "2026-12-17T08:00:00+01:00", "banned": False,
+                    "rate_limits": {"search_people": {"daily": 25},
+                                    "persons/enrich": {"daily": 25}}}
+        if name == "lookup":
+            if params["type"] == "country":
+                return {"values": [{"value": US, "label": "United States"}]
+                        if params.get("q") == "United States" else []}
+            if params["type"] == "industry":
+                return {"values": [{"value": "financial-services", "label": "Financial Services"}]}
+            return {"values": []}
+        if name == "search_organizations":
+            return {"results": [{"uuid": "o-1", "name": "Northvale Payments"},
+                                {"uuid": "o-2", "name": "Lakeside Merchant Co"}], "total": 2}
+        if name == "search_people":
+            if "past_job_titles" in params:      # the candidate search
+                return {"results": PEOPLE, "total": 1234}
+            total = self.dev_total if self.dev_total is not None else len(self.developers)
+            return {"results": self.developers, "total": total}
+        if name == "enrich_person_bulk":
+            if self.enrich is not None:
+                return self.enrich(params["persons"])
+            out = []
+            for req in params["persons"]:
+                uuid = req["linkedin_url"].rsplit("/", 1)[1]
+                src = next(p for p in PEOPLE if p["uuid"] == uuid)
+                domain = src["organization"].get("website_domain") or "elsewhere.example"
+                out.append({"uuid": uuid, "full_name": src["full_name"], "title": src["title"],
+                            "emails": [
+                                {"email": f"{uuid}@gmail.example", "type": "PE", "verified": True},
+                                {"email": f"{uuid}@other.example", "type": "BE", "verified": True},
+                                {"email": f"{uuid}@{domain}", "type": "BE", "verified": True}]})
+            return {"results": out}
+        raise AssertionError(name)
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == f"Bearer {KEY}"
+        assert str(request.url) == sq.MCP_URL
+        if self.status != 200:
+            return httpx.Response(self.status, json={})
+        body = json.loads(request.content)
+        if "id" not in body:
+            return httpx.Response(202)
+        if body["method"] == "initialize":
+            result = {"protocolVersion": sq.PROTOCOL_VERSION, "capabilities": {}}
+        else:
+            name, args = body["params"]["name"], body["params"]["arguments"]
+            self.calls.append((name, args))
+            result = {"content": [{"type": "text", "text": json.dumps(self._result(name, args))}]}
+        message = {"jsonrpc": "2.0", "id": body["id"], "result": result}
+        if self.stream:
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream", "mcp-session-id": "s1"},
+                content=f"event: message\ndata: {json.dumps(message)}\n\n")
+        return httpx.Response(200, json=message, headers={"mcp-session-id": "s1"})
+
+    @property
+    def transport(self):
+        return httpx.MockTransport(self.handler)
+
+
+@pytest_asyncio.fixture
+async def state(tmp_path):
+    s = StateManager(db_path=str(tmp_path / "t.db"))
+    await s.init_db()
+    await seed_signal_catalog(s)
+    return s
+
+
+@pytest.fixture(autouse=True)
+def _fresh_keys():
+    sq._REJECTED.clear()
+    yield
+    sq._REJECTED.clear()
+
+
+async def verified(email, env=None):
+    return "verified"
+
+
+# ── the client ──
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_the_client_reads_json_and_event_stream_answers(stream):
+    fake = FakeSalesQL(stream=stream)
+    async with sq.SalesQL(KEY, transport=fake.transport) as client:
+        account = await client.account_status()
+    assert account["plan"] == "Free" and account["credits"] == 50
+    assert account["credits_refresh_date"] == "2026-12-17" and account["reveals_per_day"] == 25
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_key_is_not_sent_again():
+    fake = FakeSalesQL(status=401)
+    with pytest.raises(sq.SalesQLError, match="rejected"):
+        async with sq.SalesQL(KEY, transport=fake.transport) as client:
+            await client.account_status()
+    fake.status = 200
+    with pytest.raises(sq.SalesQLError, match="rejected"):
+        async with sq.SalesQL(KEY, transport=fake.transport) as client:
+            await client.account_status()
+    assert not fake.calls
+
+
+@pytest.mark.asyncio
+async def test_a_rate_limit_says_so():
+    fake = FakeSalesQL(status=429)
+    with pytest.raises(sq.SalesQLError, match="limit"):
+        async with sq.SalesQL(KEY, transport=fake.transport) as client:
+            await client.account_status()
+
+
+def test_a_key_that_cannot_be_a_header_is_refused():
+    for bad in ("", "  ", "ke\ny", "clé"):
+        with pytest.raises(sq.SalesQLError):
+            sq.SalesQL(bad)
+
+
+# ── grading ──
+
+def test_company_sizes_from_the_icp():
+    assert collector.sizes_for("2-50") == ["1-10", "11-50"]
+    assert collector.sizes_for("under 200 employees") == ["1-10", "11-50", "51-200"]
+    assert collector.sizes_for("500+") == ["201-500", "501-1000", "1001-5000", "5001-10000", "10001+"]
+    assert collector.sizes_for("") == []
+
+
+def test_technical_words_match_on_word_boundaries():
+    words = ["engineer", "cto"]
+    assert collector.technical_word("Founder & CTO", words) == "cto"
+    assert collector.technical_word("Director of Engineering", words) == ""
+    assert collector.technical_word("Doctor", words) == ""          # "cto" inside a word
+    assert collector.technical_word("Sales Engineer", words) == "engineer"
+
+
+def test_names_lose_post_nominals():
+    assert collector.split_name("Ben Sample, MBA") == ("Ben", "Sample")
+    assert collector.split_name("Ada  Example") == ("Ada", "Example")
+    assert collector.split_name("Mononym") == ("Mononym", "")
+
+
+def test_the_work_address_at_the_company_wins():
+    profile = {"emails": [
+        {"email": "a@gmail.example", "type": "PE", "verified": True},
+        {"email": "a@other.example", "type": "BE", "verified": True},
+        {"email": "a@northvale.example", "type": "BE", "verified": False},
+        {"email": "...@northvale.example", "type": "BE", "verified": True},   # still masked
+    ]}
+    assert collector.pick_email(profile, "northvale.example") == ("a@northvale.example", False)
+    assert collector.pick_email({"emails": [profile["emails"][0]]}, "x.example") == ("", False)
+
+
+# ── search ──
+
+@pytest.mark.asyncio
+async def test_a_search_grades_everyone_and_spends_nothing(state):
+    fake = FakeSalesQL(developers=[
+        {"uuid": "d1", "organization": {"uuid": "o-2"}},
+        {"uuid": "d2", "organization": {"uuid": "o-2"}}])
+    summary = await collector.search(state, make_config(), KEY, transport=fake.transport)
+    assert summary["found"] == 5 and summary["new"] == 5 and summary["total"] == 1234
+    rows = {r["id"]: r for r in await state.get_salesql_candidates()}
+    assert rows["p-ada"]["grade"] == "qualified" and rows["p-ada"]["dev_count"] == 0
+    assert rows["p-ben"]["grade"] == "rejected" and "2 people" in rows["p-ben"]["reason"]
+    assert rows["p-cal"]["grade"] == "rejected" and "cto" in rows["p-cal"]["reason"]
+    assert rows["p-dee"]["grade"] == "unsure" and "no company record" in rows["p-dee"]["reason"]
+    assert rows["p-eve"]["grade"] == "unsure" and "51-200" in rows["p-eve"]["reason"]
+    assert not fake.tools("enrich_person_bulk")
+
+    candidate_search = next(a["params"] for a in fake.tools("search_people")
+                            if "past_job_titles" in a["params"])
+    assert candidate_search["job_titles"] == {"include": ["Founder", "Owner"]}
+    assert candidate_search["organization_employee_ranges"] == ["1-10", "11-50"]
+    assert candidate_search["organization_countries"] == [US]
+    assert candidate_search["organization_industries"] == ["financial-services"]
+    assert candidate_search["has_work_emails"] is True
+    # Only the two companies whose founder could still qualify were checked, in one search.
+    dev_checks = [a["params"] for a in fake.tools("search_people")
+                  if "past_job_titles" not in a["params"]]
+    assert len(dev_checks) == 1 and dev_checks[0]["organization_uuids"] == ["o-1", "o-2"]
+
+
+@pytest.mark.asyncio
+async def test_a_cut_short_developer_check_leaves_companies_unsure(state):
+    fake = FakeSalesQL(developers=[{"uuid": "d1", "organization": {"uuid": "o-2"}}],
+                       dev_total=400)
+    await collector.search(state, make_config(), KEY, transport=fake.transport)
+    rows = {r["id"]: r for r in await state.get_salesql_candidates()}
+    assert rows["p-ada"]["grade"] == "unsure" and rows["p-ada"]["dev_count"] is None
+    assert rows["p-ben"]["grade"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_lookups_are_cached(state):
+    fake = FakeSalesQL()
+    await collector.search(state, make_config(), KEY, transport=fake.transport)
+    first = len(fake.tools("lookup"))
+    await collector.search(state, make_config(), KEY, transport=fake.transport)
+    assert first == 2 and len(fake.tools("lookup")) == first
+
+
+@pytest.mark.asyncio
+async def test_company_keywords_find_the_companies_first(state):
+    fake = FakeSalesQL()
+    config = make_config(company_keywords=["merchant services"])
+    await collector.search(state, config, KEY, transport=fake.transport)
+    org_search = fake.tools("search_organizations")[0]["params"]
+    assert org_search["name"] == ["merchant services"] and org_search["countries"] == [US]
+    people_search = next(a["params"] for a in fake.tools("search_people")
+                         if "past_job_titles" in a["params"])
+    assert people_search["organization_uuids"] == ["o-1", "o-2"]
+    assert "organization_industries" not in people_search
+
+
+@pytest.mark.asyncio
+async def test_a_second_search_keeps_what_was_already_decided(state):
+    fake = FakeSalesQL()
+    await collector.search(state, make_config(), KEY, transport=fake.transport)
+    await state.update_salesql_candidate("p-ada", status="revealed", prospect_id="x")
+    summary = await collector.search(state, make_config(), KEY, transport=fake.transport)
+    assert summary["new"] == 0
+    row = (await state.get_salesql_candidates(ids=["p-ada"]))[0]
+    assert row["status"] == "revealed" and row["prospect_id"] == "x"
+
+
+# ── reveal ──
+
+@pytest.mark.asyncio
+async def test_revealing_makes_a_prospect_with_the_company_address(state):
+    fake = FakeSalesQL()
+    config = make_config()
+    await collector.search(state, config, KEY, transport=fake.transport)
+    summary = await collector.reveal(state, config, KEY, ["p-ada"], verify=verified,
+                                     transport=fake.transport)
+    assert summary["revealed"] == 1 and summary["credits_used"] == 1
+    prospect = await state.get_prospect_by_email("p-ada@northvale.example")
+    assert prospect.first_name == "Ada" and prospect.last_name == "Example"
+    assert prospect.email_status == "verified" and prospect.status == "new"
+    assert prospect.source == "salesql" and "No software job titles" in prospect.personalization_notes
+    company = await state.get_company(prospect.company_id)
+    assert company.domain == "northvale.example" and company.external_id == "salesql:o-1"
+    assert await state.count_writable_prospects() == 1
+    assert fake.tools("enrich_person_bulk")[0]["params"]["persons"] == [
+        {"linkedin_url": "https://linkedin.com/in/p-ada"}]
+    assert await collector.reveals_left_today(state, config) == 24
+
+
+@pytest.mark.asyncio
+async def test_the_daily_cap_and_the_credits_hold_people_back(state):
+    fake = FakeSalesQL(credits=50)
+    config = make_config(max_reveals_per_day=1)
+    await collector.search(state, config, KEY, transport=fake.transport)
+    summary = await collector.reveal(state, config, KEY, ["p-ada", "p-ben"], verify=verified,
+                                     transport=fake.transport)
+    assert summary["revealed"] == 1 and summary["held_back"] == 1
+    assert "cap" in summary["messages"][0]
+    assert len(fake.tools("enrich_person_bulk")[0]["params"]["persons"]) == 1
+    # Tomorrow's allowance is untouched; today's is spent.
+    again = await collector.reveal(state, config, KEY, ["p-ben"], verify=verified,
+                                   transport=fake.transport)
+    assert again["revealed"] == 0 and len(fake.tools("enrich_person_bulk")) == 1
+
+    fake2 = FakeSalesQL(credits=0)
+    out = await collector.reveal(state, make_config(), KEY, ["p-ben"], verify=verified,
+                                 transport=fake2.transport)
+    assert out["held_back"] == 1 and "credits" in out["messages"][0]
+    assert not fake2.tools("enrich_person_bulk")
+
+
+@pytest.mark.asyncio
+async def test_an_unverifiable_address_is_never_writable_unless_salesql_verified_it(state):
+    async def guess(email, env=None):
+        return "guess"
+
+    async def invalid(email, env=None):
+        return "invalid"
+    fake = FakeSalesQL()
+    await collector.search(state, make_config(), KEY, transport=fake.transport)
+    await collector.reveal(state, make_config(trust_verified=False), KEY, ["p-ada"],
+                           verify=guess, transport=fake.transport)
+    assert (await state.get_prospect_by_email("p-ada@northvale.example")).email_status == "guess"
+    await collector.reveal(state, make_config(), KEY, ["p-ben"], verify=guess,
+                           transport=fake.transport)
+    assert (await state.get_prospect_by_email("p-ben@lakeside.example")).email_status == "verified"
+    await collector.reveal(state, make_config(), KEY, ["p-cal"], verify=invalid,
+                           transport=fake.transport)
+    assert (await state.get_prospect_by_email("p-cal@hillside.example")).email_status == "invalid"
+    assert await state.count_writable_prospects() == 1
+
+
+@pytest.mark.asyncio
+async def test_do_not_contact_is_honoured_before_any_credit_is_spent(state):
+    fake = FakeSalesQL()
+    config = make_config()
+    config.compliance.do_not_contact = ["northvale.example"]
+    await collector.search(state, config, KEY, transport=fake.transport)
+    summary = await collector.reveal(state, config, KEY, ["p-ada"], verify=verified,
+                                     transport=fake.transport)
+    assert summary["skipped"] == 1 and summary["credits_used"] == 0
+    assert not fake.tools("enrich_person_bulk")
+    assert (await state.get_salesql_candidates(ids=["p-ada"]))[0]["status"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_people_salesql_cannot_find_or_who_have_no_work_address(state):
+    def enrich(persons):
+        return {"results": [{"error": "not found"},
+                            {"uuid": "p-ben", "full_name": "Ben Sample",
+                             "emails": [{"email": "ben@gmail.example", "type": "PE"}]}]}
+    fake = FakeSalesQL(enrich=enrich)
+    config = make_config()
+    await collector.search(state, config, KEY, transport=fake.transport)
+    summary = await collector.reveal(state, config, KEY, ["p-ada", "p-ben"], verify=verified,
+                                     transport=fake.transport)
+    assert summary["failed"] == 1 and summary["no_email"] == 1 and summary["credits_used"] == 1
+    assert await state.count_writable_prospects() == 0
+
+
+@pytest.mark.asyncio
+async def test_signals_are_recorded_only_once_confirmed(state):
+    fake = FakeSalesQL()
+    config = make_config()
+    await collector.search(state, config, KEY, transport=fake.transport)
+    await collector.reveal(state, config, KEY, ["p-ada"], verify=verified,
+                           transport=fake.transport)
+    assert not await state.get_observations(signal_code="INHOUSE_DEV_COUNT")
+    await state.set_signal_status("INHOUSE_DEV_COUNT", "confirmed")
+    await state.set_signal_status("FOUNDER_NON_TECHNICAL", "confirmed")
+    await collector.search(state, config, KEY, transport=fake.transport)
+    await collector.reveal(state, config, KEY, ["p-dee"], verify=verified,
+                           transport=fake.transport)
+    assert len(await state.get_observations(signal_code="FOUNDER_NON_TECHNICAL")) == 1
+    # p-dee's company was never checked, so no developer count is claimed.
+    assert not await state.get_observations(signal_code="INHOUSE_DEV_COUNT")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_reveal_still_counts_against_today(state):
+    def boom(persons):
+        return "not json the client can use"
+    fake = FakeSalesQL(enrich=boom)
+    config = make_config()
+    await collector.search(state, config, KEY, transport=fake.transport)
+    with pytest.raises(sq.SalesQLError):
+        await collector.reveal(state, config, KEY, ["p-ada", "p-ben"], verify=verified,
+                               transport=fake.transport)
+    assert await collector.reveals_left_today(state, config) == 23
+
+
+@pytest.mark.asyncio
+async def test_the_cap_set_on_the_dashboard_wins_over_the_file(state):
+    config = make_config(max_reveals_per_day=25)
+    assert await collector.daily_cap(state, config) == 25
+    await collector.set_daily_cap(state, 60)
+    assert await collector.daily_cap(state, config) == 60
+    assert await collector.reveals_left_today(state, config) == 60
+    for bad in (-1, 1001, True, "60", None, 2.5):
+        with pytest.raises(ValueError):
+            await collector.set_daily_cap(state, bad)
+    await collector.set_daily_cap(state, 0)
+    fake = FakeSalesQL()
+    await collector.search(state, config, KEY, transport=fake.transport)
+    out = await collector.reveal(state, config, KEY, ["p-ada"], verify=verified,
+                                 transport=fake.transport)
+    assert out["held_back"] == 1 and not fake.tools("enrich_person_bulk")

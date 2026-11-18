@@ -714,6 +714,66 @@ def load_email_rules(config) -> str:
     return text
 
 
+class SalesQLConfig(BaseModel):
+    """Finding people through SalesQL (harvey/collectors/salesql.py).
+
+    Searching is free. Revealing a contact spends one SalesQL credit, and
+    only happens for people a human ticked, inside ``max_reveals_per_day``.
+    """
+    # The most contacts Harvey will reveal in one day (UTC), whatever the
+    # SalesQL plan allows. 0 turns revealing off.
+    max_reveals_per_day: int = 25
+    # Job titles to search for. Empty: icp.titles.
+    job_titles: list[str] = []
+    # SalesQL industry names ("Financial Services"). Empty: icp.industries.
+    industries: list[str] = []
+    # Words in a company's name ("merchant services"). When set, Harvey finds
+    # the companies first and then their people, which is far less noisy than
+    # an industry filter. Each entry is one free company search.
+    company_keywords: list[str] = []
+    # SalesQL company sizes ("1-10", "11-50"). Empty: worked out from
+    # icp.company_size.
+    company_sizes: list[str] = []
+    # Countries by name. Empty: the countries named in icp.geography.
+    countries: list[str] = []
+    # A title or headline containing one of these marks the person as
+    # technical, and anyone who ever held one of these titles is left out of
+    # the search. Empty the list to keep technical people in.
+    technical_words: list[str] = [
+        "engineer", "developer", "programmer", "cto", "chief technology",
+        "software architect", "devops", "full stack", "data scientist",
+    ]
+    # Job titles that mean a company has software people of its own. A
+    # company with none is what "no in-house developers" means here.
+    developer_titles: list[str] = [
+        "Software Engineer", "Software Developer", "Developer", "Programmer",
+        "CTO", "Engineering Manager", "DevOps Engineer", "QA Engineer",
+        "Web Developer", "Full Stack Developer",
+    ]
+    # Turn the company check off to keep companies with their own developers.
+    require_no_developers: bool = True
+    # How many candidates one search brings back (20 to 100).
+    page_size: int = 20
+    # SalesQL marks some addresses as verified. When Harvey's own verifier
+    # can't reach a verdict, trust that mark. An address Harvey's verifier
+    # calls invalid is never sent either way.
+    trust_verified: bool = True
+
+    @field_validator("max_reveals_per_day")
+    @classmethod
+    def _cap_range(cls, v: int) -> int:
+        if v < 0 or v > 1000:
+            raise ValueError("must be between 0 and 1000")
+        return v
+
+    @field_validator("page_size")
+    @classmethod
+    def _page_range(cls, v: int) -> int:
+        if v < 20 or v > 100:
+            raise ValueError("must be between 20 and 100")
+        return v
+
+
 class HarveyConfig(BaseModel):
     persona: PersonaConfig
     product: ProductConfig
@@ -723,6 +783,7 @@ class HarveyConfig(BaseModel):
     brain: BrainConfig = BrainConfig()
     compliance: ComplianceConfig = ComplianceConfig()
     writer: WriterConfig = WriterConfig()
+    salesql: SalesQLConfig = SalesQLConfig()
     # The file it was loaded from, so a running Harvey can re-read the
     # sending mode from that same file (refresh_sending_mode).
     _source_path: str | None = PrivateAttr(default=None)

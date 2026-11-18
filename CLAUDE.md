@@ -101,6 +101,7 @@ CLOUDFLARE_ACCOUNT_ID=  CLOUDFLARE_API_TOKEN=   # deep JS crawling for training
 SERPER_API_KEY=            # web search + discovery (2,500 free, then a $50 prepaid pack)
 PRECLEARED_API_KEY=        # cold-email check before first sends (see Step 7)
 TRULYINBOX_API_KEY=        # warmup: set by 'harvey trulyinbox connect' (see Step 2b)
+SALESQL_API_KEY=           # find people by title and industry: set by 'harvey salesql connect'
 ```
 
 **Recommended provider — Gmail:** for <50 cold emails/day, a real Google Workspace mailbox on a *dedicated secondary domain* (never the main one) is the most deliverable, cheapest (~$7/mo) option. Set `channels.email.provider: gmail` in harvey.yaml, put the OAuth client id/secret in `.env`, then run `harvey gmail auth` (one-time browser login). SMTP works with any mailbox (AgentMail, Fastmail). Instantly still works as a legacy option.
@@ -175,7 +176,7 @@ Ask the user these questions and build `harvey.yaml` and `skills/product_knowled
 
 ### Step 4: Confirm Signals
 
-Harvey ships a catalog of 29 signals it knows how to collect, all **proposed** and
+Harvey ships a catalog of 31 signals it knows how to collect, all **proposed** and
 none active. Nothing is prospected against until the user confirms them.
 
 Send them to `harvey dashboard` → **Signals**, where each one shows a
@@ -293,6 +294,7 @@ Users will come back with questions and tasks. Common ones:
 - **"I want to change what Harvey says"** → Skills are in `skills/`, prompts are in `prompts/`. Both are plain markdown files. Edit them directly.
 - **"Train Harvey on a different product"** → `harvey train <new-url>`
 - **"How do I see the database?"** → It's at `data/harvey.db`. They can open it with any SQLite tool, or ask you to query it.
+- **"I want to find people by job title, not by company"** → SalesQL (README, "Finding people with SalesQL"). Have them run `harvey salesql connect` in their own terminal (don't ask for the key in chat), then `harvey salesql search` (free) and `harvey salesql list`. Revealing spends their SalesQL credits, one per person: never run `harvey salesql reveal` unless they named who to reveal or said to reveal the qualified ones, and tell them the number first.
 - **"I just want the prospect list"** → `harvey export` writes a sequencer-ready CSV (verified/risky emails only; `--all` for everything). Also available as Export buttons on the dashboard's Contacts tab. Harvey is valuable purely as a list-builder even if the user never lets it send.
 
 ---
@@ -342,6 +344,7 @@ harvey discover              # Find businesses; --providers / --estimate / --pro
 harvey sending pause|resume  # Kill switch for all outbound
 harvey warmup [domain]       # Sending-domain readiness: SPF/DKIM/DMARC, age, blocklists, ramp, TrulyInbox warmup
 harvey trulyinbox [connect|other]  # Warmup service: connect TrulyInbox, or record another service
+harvey salesql [connect|search|list|reveal]  # Find people through SalesQL: search is free, reveal spends credits
 ```
 
 ### Common Issues

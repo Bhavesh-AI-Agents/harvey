@@ -9,6 +9,20 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Find people through SalesQL.** Connect a SalesQL API/MCP key
+  (`harvey salesql connect`, or the Discover tab) and Harvey can search for
+  people by job title, industry or company-name keywords, company size and
+  country. Searching is free and returns masked contact data. Each person is
+  marked qualified, unsure or rejected with the reason, from two checks: a
+  technical word in their title or headline, and whether their company has
+  anyone with a software job title. Revealing a contact is the only step that
+  spends SalesQL credits; it happens only for people you tick, asks first, and
+  stops at `salesql.max_reveals_per_day` and at the credits you have left.
+  Revealed work addresses go through Harvey's verifier before anything is
+  written to them, personal addresses are never used, and the do-not-contact
+  list is applied before a credit is spent. Two new signals,
+  `INHOUSE_DEV_COUNT` and `FOUNDER_NON_TECHNICAL`. Harvey's own code talks to
+  SalesQL; the writing model still runs with no tools.
 - **Company fit and the company register.** The Companies tab now sorts by a
   0-100 fit score worked out from what Harvey already holds: the ICP sector
   match, a contact with a target title, the best email found, and an open
