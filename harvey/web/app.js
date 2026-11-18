@@ -1654,6 +1654,11 @@ function emailTag(p) {
 function quotaCardHtml(data) {
   const provider = data && data.quota_provider;
   if (!provider) return '';
+  if (provider === 'command') {
+    return '<h2>Your model command</h2><p class="muted">Harvey thinks through your own program ' +
+      '(brain.provider: command). There is no subscription quota to read, so budgets count ' +
+      'Harvey\'s own calls. Any limit on spending is set where that program runs.</p>';
+  }
   const title = provider === 'codex' ? 'Codex (ChatGPT plan) Quota' : 'Claude Subscription Quota';
   let html = '<h2>' + escHtml(title) + '</h2>';
   if (!data.quota || !Object.keys(data.quota).length) {

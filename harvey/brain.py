@@ -10,6 +10,7 @@ other one.
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -39,7 +40,7 @@ _NON_RETRYABLE_PATTERNS = (
 )
 
 
-PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex"}
+PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex", "command": "Your model command"}
 
 # Settings key holding the brain's last health transition, for `harvey
 # status` and the dashboard: {"provider", "status": "ok"|"paused", "reason",
@@ -74,6 +75,14 @@ def active_brain_status(raw: str, provider: str) -> dict:
     return status if status.get("provider") == provider else {}
 
 
+class _NoQuota:
+    """A provider with no subscription quota to read: the budget falls back
+    to Harvey's own count of calls today."""
+
+    async def get_utilization(self):
+        return None
+
+
 class BrainUnavailable(Exception):
     """The provider can't be used until the operator acts. Raised only where
     a caller must leave its input untouched for a later retry."""
@@ -105,6 +114,8 @@ class Brain:
                 model=self.model, reasoning_effort=self.config.reasoning_effort
             )
             self.quota = CodexQuotaClient(self.codex)
+        elif self.provider == "command":
+            self.quota = _NoQuota()
         else:
             # Lazy import avoids a cycle (quota -> usage -> state).
             from harvey.integrations.quota import QuotaClient
@@ -137,6 +148,8 @@ class Brain:
         PROVIDER_RECHECK_SECONDS, so a persistent problem doesn't start
         runtimes every heartbeat.
         """
+        if self.provider == "command":
+            return self._command_problem()
         if self.provider != "codex":
             return await self._claude_preflight()
         from harvey.codex import CodexError
@@ -264,6 +277,11 @@ class Brain:
         """
         if self.provider == "codex":
             return await self._think_codex(
+                prompt, session_id=session_id, timeout=timeout,
+                max_retries=max_retries, agent=agent, task=task,
+            )
+        if self.provider == "command":
+            return await self._think_command(
                 prompt, session_id=session_id, timeout=timeout,
                 max_retries=max_retries, agent=agent, task=task,
             )
@@ -408,6 +426,107 @@ class Brain:
             f"Brain call failed after {max_retries + 1} attempts. "
             f"Last error: {str(last_error)[:200]}"
         )
+        return ""
+
+    def _command_problem(self) -> str:
+        """Why the configured command can't be run ("" when it can)."""
+        import shutil
+        program = self.config.command[0] if self.config.command else ""
+        if not program:
+            return "brain.command is empty."
+        if not shutil.which(program):
+            return f"The model command '{program}' was not found or can't be run by this user."
+        return ""
+
+    async def _think_command(
+        self, prompt: str, session_id: str | None, timeout: float,
+        max_retries: int, agent: str, task: str,
+    ) -> str:
+        """One model call through the operator's own program.
+
+        The prompt goes to the program's standard input; its output is the
+        reply. It may instead print one JSON object {"harvey_reply": text,
+        "model": name, "input_tokens": n, "output_tokens": n, "cost_usd": x}
+        so the call shows on the Usage tab with its model and tokens.
+        HARVEY_AGENT and HARVEY_TASK in its environment say what the call is
+        for. A non-zero exit or empty output is a failed call.
+        """
+        problem = self._command_problem()
+        if problem:
+            logger.error(f"Model call not sent: {problem}")
+            return ""
+        label = session_id or ""
+        if not agent and label.startswith("harvey-"):
+            agent = label[len("harvey-"):].split("-")[0]
+        env = {**os.environ, "HARVEY_AGENT": agent or "", "HARVEY_TASK": task or label}
+        last_error = ""
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                await asyncio.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)))
+            process = None
+            started = time.monotonic()
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *self.config.command, env=env,
+                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE)
+                try:
+                    stdout, stderr = await asyncio.wait_for(
+                        process.communicate(prompt.encode("utf-8")), timeout=timeout)
+                except asyncio.TimeoutError:
+                    logger.error(f"Model command timed out after {timeout:.0f}s. Stopping it.")
+                    last_error = "timeout"
+                    continue
+                if process.returncode != 0:
+                    last_error = stderr.decode(errors="replace").strip()[-300:]
+                    logger.error(
+                        f"Model command exited with code {process.returncode}: {last_error}")
+                    continue
+                raw = stdout.decode(errors="replace").strip()
+                reply, usage = raw, {}
+                if raw.startswith("{"):
+                    try:
+                        envelope = json.loads(raw)
+                    except ValueError:
+                        envelope = None
+                    if isinstance(envelope, dict) and isinstance(envelope.get("harvey_reply"), str):
+                        reply, usage = envelope["harvey_reply"].strip(), envelope
+                if not reply:
+                    last_error = "the command printed nothing"
+                    continue
+
+                def number(key, kind):
+                    value = usage.get(key)
+                    return kind(value) if isinstance(value, (int, float)) \
+                        and not isinstance(value, bool) and value >= 0 else kind(0)
+                try:
+                    await self.state.increment_usage(provider="command")
+                    await self.state.record_usage_event(
+                        agent=agent, task=task or label, session_id=label,
+                        model=str(usage.get("model") or "")[:80],
+                        input_tokens=number("input_tokens", int),
+                        output_tokens=number("output_tokens", int),
+                        cost_usd=number("cost_usd", float),
+                        duration_ms=int((time.monotonic() - started) * 1000),
+                        num_turns=1, source="command", provider="command")
+                except Exception as e:   # accounting must never break the reply
+                    logger.warning(f"Failed to record usage: {e}")
+                return reply
+            except FileNotFoundError:
+                logger.error(f"Model command not found: {self.config.command[0]}")
+                return ""
+            except Exception as e:
+                last_error = str(e)
+                logger.error(f"Model command error: {e}")
+            finally:
+                if process is not None and process.returncode is None:
+                    try:
+                        process.kill()
+                        await asyncio.wait_for(process.wait(), timeout=KILL_REAP_SECONDS)
+                    except Exception:
+                        pass
+        logger.error(f"Model command failed after {max_retries + 1} attempts. "
+                     f"Last error: {last_error[:200]}")
         return ""
 
     async def _think_codex(
