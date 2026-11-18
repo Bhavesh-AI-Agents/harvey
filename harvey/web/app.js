@@ -2411,12 +2411,50 @@ function renderContacts() {
         ? '<button class="btn btn-ghost btn-sm" onclick="toggleOptOut(' + i + ')" ' +
           'aria-expanded="' + (_optOut.id === p.id) + '" title="What made Harvey stop emailing them">' +
           (p.status === 'opted_out' ? 'Why?' : 'Opt-out history') + '</button>' : '') +
+        '<button class="btn btn-ghost btn-sm" onclick="toggleContactDetails(' + i + ')" aria-expanded="' +
+        (_contactOpen === p.id) + '" title="Everything Harvey holds on this person">Details</button>' +
         '<button class="btn btn-ghost btn-sm row-action" onclick="fbProspect(' + i + ')" ' +
         'title="Leave feedback on this contact">Feedback</button></div></td></tr>';
+    if (_contactOpen === p.id) html += '<tr class="detail-row"><td colspan="8">' + contactDetailsPanel(p) + '</td></tr>';
     if (_optOut.id === p.id) html += '<tr class="detail-row"><td colspan="8">' + optOutPanel(p) + '</td></tr>';
   }
   rowsEl.innerHTML = html + '</tbody></table></div>' +
     '<div class="table-foot">' + rows.length + ' of ' + _prospects.length + ' contacts</div>';
+}
+
+// Everything held on one contact: every email and phone the source returned,
+// not only the one of each that Harvey uses.
+let _contactOpen = null;
+
+function toggleContactDetails(i) {
+  const p = _prospects[i];
+  if (!p) return;
+  _contactOpen = _contactOpen === p.id ? null : p.id;
+  renderContacts();
+}
+
+function contactDetailsPanel(p) {
+  const d = p.details || {};
+  const row = (label, value) => value ? '<tr><th style="white-space:nowrap;vertical-align:top">' + label +
+    '</th><td style="white-space:normal">' + value + '</td></tr>' : '';
+  const link = u => safeHref(u) ? '<a href="' + safeHref(u) + '" target="_blank" rel="noopener noreferrer">' + escHtml(u) + '</a>' : '';
+  const emails = (d.emails || []).map(e => escHtml(e.email) + ' <span class="muted">' + escHtml(e.kind || '') +
+    (e.verified ? ', marked valid' : '') + (e.used_by_harvey ? ', the one Harvey emails' : '') +
+    (e.kind === 'personal' ? ', never emailed' : '') + '</span>').join('<br>');
+  const phones = (d.phones || []).map(x => escHtml(x.phone) + ' <span class="muted">' +
+    escHtml([x.kind, x.country, x.verified ? 'marked valid' : ''].filter(Boolean).join(', ')) + '</span>').join('<br>');
+  const c = d.company || {};
+  return '<div style="padding:4px 0"><table><tbody>' +
+    row('LinkedIn', link(p.linkedin_url || d.linkedin_url)) +
+    row('Emails', emails || escHtml(p.email)) +
+    row('Phones', phones || escHtml(p.phone)) +
+    row('Location', escHtml(d.location)) +
+    row('Headline', escHtml(d.headline)) +
+    row('Company', escHtml([c.name || p.company, c.domain, c.industry || p.industry, (c.size || p.company_size) ? (c.size || p.company_size) + ' people' : ''].filter(Boolean).join(' · '))) +
+    row('Found via', link(p.source_url) || escHtml(sourceLabel(p.source))) +
+    row('Notes', escHtml(p.personalization_notes).replace(/\n/g, '<br>')) +
+    '</tbody></table>' +
+    (d.source ? '' : '<p class="muted" style="margin:6px 0 0">Harvey kept only the fields above for this contact.</p>') + '</div>';
 }
 
 // Why someone is opted out, and undoing it. Harvey never moves anyone off
