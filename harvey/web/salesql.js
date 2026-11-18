@@ -219,7 +219,7 @@ function sqPanel() {
       items.map(i => '<option value="' + escHtml(i.id) + '"' + (i.id === SQ.audId ? ' selected' : '') + '>' +
         escHtml(i.name) + '</option>').join('') +
       (SQ.audId ? '' : '<option value="" selected>New audience (not saved)</option>') + '</select>' +
-      '<button class="btn btn-secondary btn-sm" onclick="sqNewAudience()" title="Start a new audience from this one">New</button>' +
+      '<button class="btn btn-secondary btn-sm" onclick="sqNewAudience()" title="Start a new, empty audience with its own list of people">New</button>' +
       (SQ.audId ? '<button class="btn btn-danger btn-sm" onclick="sqDeleteAudience()">Delete</button>' : '') + '</div>';
   }
   html += '<label class="form-label" for="sq-name" style="margin-top:10px">Name</label>' +
@@ -576,9 +576,11 @@ async function sqSelectAudience(id) {
 }
 
 function sqNewAudience() {
+  if (SQ.dirty && !confirm('Leave this audience without saving your changes?')) return;
   SQ.audId = '';
-  SQ.aud = {...JSON.parse(JSON.stringify(SQ.aud)), name: 'New audience'};
-  SQ.dirty = true; SQ.notes = [];
+  SQ.aud = {...sqBlankAudience(), name: 'New audience'};   // a clean start; "Save as new" copies
+  SQ.dirty = true; SQ.notes = []; SQ.picks = new Set(); SQ.tab = 'qualified';
+  SQ.open = new Set(['job_titles']);
   sqRender();
   const name = sqEl('sq-name');
   if (name) { name.focus(); name.select(); }
@@ -595,6 +597,8 @@ async function sqDeleteAudience() {
 // ── Results ──
 
 function sqRows(tab) {
+  // A new audience that isn't saved yet has found nobody.
+  if (!SQ.audId && (SQ.data.audiences || {}).saved) return [];
   if (tab === 'done') return SQ.data.handled || [];
   return (SQ.data.candidates || []).filter(r => (r.grade || 'unsure') === tab);
 }
@@ -607,8 +611,8 @@ function sqSearchLabel() {
 function sqResults() {
   const rows = sqRows(SQ.tab);
   let html = '<div class="sq-results-head"><div><div class="sq-panel-title">People</div>' +
-    '<p class="desc">Searching spends nothing. Each search brings the next ' + (SQ.aud.page_size || 100) +
-    ' people for this audience.</p></div>' +
+    '<p class="desc">The people <b>' + escHtml(SQ.aud.name) + '</b> has found. Searching spends nothing; each search ' +
+    'brings its next ' + (SQ.aud.page_size || 100) + ' people. Each audience keeps its own list.</p></div>' +
     '<button class="btn btn-primary" id="sq-search-btn" onclick="sqSearch()"' + (SQ.busy ? ' disabled' : '') + '>' +
     sqSearchLabel() + '</button></div>';
   html += '<div class="sq-tabs" role="tablist">' + SQ_TABS.map(([key, label]) =>

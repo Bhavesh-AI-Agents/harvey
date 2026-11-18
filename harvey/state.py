@@ -567,6 +567,13 @@ MIGRATIONS: list[str] = [
     """
     ALTER TABLE usage_log ADD COLUMN command_calls INTEGER DEFAULT 0;
     """,
+    # ── v18: each SalesQL audience keeps its own list of people ──
+    """
+    -- The audience whose search found the person. Empty for people found
+    -- before audiences existed; they join the first audience that is used.
+    ALTER TABLE salesql_candidates ADD COLUMN audience_id TEXT DEFAULT '';
+    CREATE INDEX IF NOT EXISTS idx_salesql_audience ON salesql_candidates(audience_id, status);
+    """,
 ]
 
 BRAIN_PROVIDERS = ("claude", "codex", "command")
@@ -2225,6 +2232,7 @@ class StateManager:
         "full_name", "title", "headline", "linkedin_url", "location", "org_uuid",
         "org_name", "org_domain", "org_industry", "org_size", "has_work_email",
         "has_verified_email", "grade", "reason", "dev_count",
+        "audience_id",
     )
 
     async def upsert_salesql_candidate(self, candidate: dict) -> bool:
@@ -2245,7 +2253,13 @@ class StateManager:
             values.append(int(v) if isinstance(v, bool) else v)
         cols = ", ".join(self.SALESQL_COLUMNS)
         marks = ", ".join("?" for _ in self.SALESQL_COLUMNS)
-        updates = ", ".join(f"{c} = excluded.{c}" for c in self.SALESQL_COLUMNS)
+        # A person already handled stays on the list of the audience that
+        # found them; one still waiting moves to the audience that found
+        # them last, since its rules are the ones just applied.
+        updates = ", ".join(
+            "audience_id = CASE WHEN salesql_candidates.status = 'found' "
+            "THEN excluded.audience_id ELSE salesql_candidates.audience_id END"
+            if c == "audience_id" else f"{c} = excluded.{c}" for c in self.SALESQL_COLUMNS)
         async with self._connect() as db:
             async with db.execute(
                 "SELECT 1 FROM salesql_candidates WHERE id = ?", (cid,)) as cur:
@@ -2259,11 +2273,24 @@ class StateManager:
             await db.commit()
         return not existed
 
+    async def adopt_salesql_candidates(self, audience_id: str) -> int:
+        """Give people found before audiences existed to ``audience_id``."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                "UPDATE salesql_candidates SET audience_id = ? WHERE audience_id = ''",
+                (audience_id,))
+            await db.commit()
+            return cur.rowcount or 0
+
     async def get_salesql_candidates(
         self, status: str | None = None, ids: list[str] | None = None, limit: int = 500,
+        audience_id: str | None = None,
     ) -> list[dict]:
         sql, params = "SELECT * FROM salesql_candidates", []
         where = []
+        if audience_id is not None:
+            where.append("audience_id = ?")
+            params.append(audience_id)
         if status:
             where.append("status = ?")
             params.append(status)
@@ -2283,7 +2310,8 @@ class StateManager:
                 return [dict(r) for r in await cur.fetchall()]
 
     async def update_salesql_candidate(self, candidate_id: str, **kwargs):
-        allowed = {"status", "note", "prospect_id", "grade", "reason", "dev_count"}
+        allowed = {"status", "note", "prospect_id", "grade", "reason", "dev_count",
+                   "audience_id"}
         fields = {k: v for k, v in kwargs.items() if k in allowed}
         if not fields:
             return

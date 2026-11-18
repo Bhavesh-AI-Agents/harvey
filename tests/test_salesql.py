@@ -1006,3 +1006,22 @@ async def test_the_main_job_and_company_must_match_not_another_one_they_hold(sta
     assert rows["m-2"]["grade"] == "unsure" and "Advisory Board Member" in rows["m-2"]["reason"]
     assert rows["m-3"]["grade"] == "rejected" and "which you excluded" in rows["m-3"]["reason"]
     assert rows["m-4"]["grade"] == "unsure" and "in Retail, not an industry you included" in rows["m-4"]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_each_audience_keeps_its_own_list_of_people(state):
+    config = make_config()
+    fake = FakeSalesQL()
+    await collector.search(state, config, KEY, transport=fake.transport)      # before any audience
+    assert {r["audience_id"] for r in await state.get_salesql_candidates()} == {""}
+    first = await collector.save_audience(state, audience(name="First"))
+    assert {r["audience_id"] for r in await state.get_salesql_candidates()} == {first}   # adopted
+    await collector.reveal(state, config, KEY, ["p-ada"], verify=verified, transport=fake.transport)
+    second = await collector.save_audience(state, audience(name="Second"))
+    assert await state.get_salesql_candidates(audience_id=second) == []       # a new list starts empty
+    await collector.search(state, config, KEY, transport=fake.transport)
+    mine = {r["id"]: r for r in await state.get_salesql_candidates(audience_id=second)}
+    theirs = {r["id"] for r in await state.get_salesql_candidates(audience_id=first)}
+    assert "p-ben" in mine and theirs == {"p-ada"}        # waiting people moved; the revealed one stayed
+    await collector.delete_audience(state, second)
+    assert "p-ben" in {r["id"] for r in await state.get_salesql_candidates(audience_id="")}
