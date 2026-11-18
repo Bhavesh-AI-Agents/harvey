@@ -563,10 +563,15 @@ MIGRATIONS: list[str] = [
     ALTER TABLE outbox ADD COLUMN from_address TEXT DEFAULT '';
     CREATE INDEX IF NOT EXISTS idx_outbox_from ON outbox(from_address, status);
     """,
+    # ── v17: calls made through the operator's own model command ──
+    """
+    ALTER TABLE usage_log ADD COLUMN command_calls INTEGER DEFAULT 0;
+    """,
 ]
 
-BRAIN_PROVIDERS = ("claude", "codex")
-_USAGE_LOG_COLUMN = {"claude": "claude_calls", "codex": "codex_calls"}
+BRAIN_PROVIDERS = ("claude", "codex", "command")
+_USAGE_LOG_COLUMN = {"claude": "claude_calls", "codex": "codex_calls",
+                     "command": "command_calls"}
 
 # When a company was last profiled: the newer of the explicit check stamp
 # (set on every attempt, reachable or not) and its latest profile observation

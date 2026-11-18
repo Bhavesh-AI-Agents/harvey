@@ -650,6 +650,25 @@ and should not be imported as an outreach list. The dashboard's prospect CSV
 download follows the same policy; `?all=true` selects its raw export.
 
 
+## Using your own model program
+
+If neither subscription suits you, Harvey can think through a program of yours: a script that calls a model gateway, a local model, another provider.
+
+```yaml
+brain:
+  provider: command
+  command: ["/usr/local/bin/my-model", "--some-flag"]
+```
+
+For every model call Harvey runs the program, writes the prompt to its standard input and takes what it prints as the reply. `HARVEY_AGENT` and `HARVEY_TASK` in its environment say what the call is for. A non-zero exit or empty output counts as a failed call, and Harvey retries it. To show the model and tokens on the Usage tab, print one JSON object instead: `{"harvey_reply": "...", "model": "...", "input_tokens": 0, "output_tokens": 0, "cost_usd": 0}`.
+
+Two things change with this provider, and both are yours to handle:
+
+- **Isolation.** With Claude and Codex, Harvey itself makes sure the model runs with no tools. It cannot see inside your program. Prompts contain text from websites and from replies, which can carry planted instructions, so the program must send the prompt to a model with no tools and no access to anything else.
+- **Cost.** There is no subscription quota to read, so the budget gate falls back to Harvey's own count of calls a day. If your program bills per use, set its own limit there.
+
+On a server, `HARVEY_BRAIN_PROVIDER` and `HARVEY_BRAIN_COMMAND` in the environment win over the file.
+
 ## Using a ChatGPT plan instead (Codex)
 
 Claude is the default and needs no change. If you'd rather spend a ChatGPT plan (Plus, Pro, Business, …), Harvey can think through the [Codex CLI](https://developers.openai.com/codex) instead — still a subscription, never per-token API billing.

@@ -603,7 +603,7 @@ class UsageConfig(BaseModel):
         return v
 
 
-BRAIN_PROVIDERS = ("claude", "codex")
+BRAIN_PROVIDERS = ("claude", "codex", "command")
 CODEX_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 # Model names are passed to a CLI, so they must look like a model name and
@@ -623,6 +623,50 @@ class BrainConfig(BaseModel):
     provider: str = "claude"
     model: str = ""  # empty = the provider's own default
     reasoning_effort: str = ""  # codex only; empty = model default
+    # provider "command" only: the program Harvey runs for each model call,
+    # as a list (program, then its arguments). The prompt arrives on its
+    # standard input; what it prints is the reply. It is your program:
+    # Harvey's own isolation (no tools, no settings) does not reach inside
+    # it, so it must not give the model tools. See the README.
+    command: list[str] = []
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_environment(cls, data):
+        """HARVEY_BRAIN_PROVIDER and HARVEY_BRAIN_COMMAND, when set, win over
+        the file: a server install can point Harvey at its model without
+        editing a config file that is otherwise edited by hand."""
+        provider = os.environ.get("HARVEY_BRAIN_PROVIDER", "").strip()
+        command = os.environ.get("HARVEY_BRAIN_COMMAND", "").strip()
+        if not provider and not command:
+            return data
+        data = dict(data) if isinstance(data, dict) else {}
+        if provider:
+            data["provider"] = provider
+        if command:
+            data["command"] = command
+        return data
+
+    @field_validator("command", mode="before")
+    @classmethod
+    def _valid_command(cls, v) -> list[str]:
+        if v in (None, ""):
+            return []
+        if isinstance(v, str):
+            import shlex
+            v = shlex.split(v)
+        if not isinstance(v, list) or len(v) > 20 \
+                or not all(isinstance(x, str) and x.strip() and "\x00" not in x for x in v):
+            raise ValueError("brain.command must be a program and its arguments, "
+                             "for example [\"/usr/local/bin/my-model\", \"--json\"].")
+        return v
+
+    @model_validator(mode="after")
+    def _command_needs_a_program(self):
+        if self.provider == "command" and not self.command:
+            raise ValueError("brain.provider is 'command' but brain.command is empty. "
+                             "Set it to the program Harvey should run for each model call.")
+        return self
 
     @field_validator("provider", mode="before")
     @classmethod
