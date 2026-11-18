@@ -885,7 +885,16 @@ async def salesql_settings(request: Request):
                             status_code=400)
     await state.log_action("salesql_settings", "dashboard",
                            {k: len(v) if isinstance(v, list) else v for k, v in saved.items()})
-    return {"success": True, "search": saved}
+    # Say now, not at the next search, which names SalesQL doesn't know.
+    notes: list[str] = []
+    key = _salesql_key()
+    if key:
+        from harvey.integrations import salesql as sq
+        try:
+            notes = await collector.check_names(state, load_config(), key)
+        except sq.SalesQLError as e:
+            notes = [f"Couldn't check the names with SalesQL: {e}"]
+    return {"success": True, "search": saved, "notes": notes}
 
 
 @app.post("/api/salesql/search")

@@ -1175,9 +1175,10 @@ async function loadSalesql() {
 // Who a search looks for. Lists are typed with commas between entries.
 const SALESQL_LISTS = [
   ['job_titles', 'Job titles', 'Founder, Owner, CEO'],
-  ['states', 'States or cities', 'California (empty: the whole country)'],
+  ['states', 'States (full name)', 'California, Massachusetts (empty: the whole country)'],
+  ['cities', 'Cities', 'Boston (optional; set the state too)'],
   ['countries', 'Countries', 'United States'],
-  ['industries', 'Industries', 'Retail, Real Estate (empty: any industry)'],
+  ['industries', 'Industries (LinkedIn names)', 'Financial Services, Retail, Real Estate (empty: any industry)'],
   ['company_keywords', 'Words in the company name',
    'merchant services (when set, used in place of industries)'],
 ];
@@ -1207,6 +1208,8 @@ function salesqlSettingsForm(search, sizes) {
     '<div class="form-group"><label class="form-label" for="sq-page">People per search (20 to 100)</label>' +
     '<input class="form-input" id="sq-page" type="number" min="20" max="100" style="width:110px" value="' +
     (search.page_size || 20) + '"></div>' +
+    (_salesqlNotes.length ? '<div class="banner wait" style="margin-bottom:10px"><div>' +
+      _salesqlNotes.map(n => '<p style="margin:0 0 4px">' + escHtml(n) + '</p>').join('') + '</div></div>' : '') +
     '<button class="btn btn-secondary btn-sm" onclick="saveSalesqlSettings()">Save search settings</button>' +
     '<p class="desc" style="margin:8px 0 0">Saved here, these replace the values in harvey.yaml. ' +
     'Pressing Search again with the same settings brings the next group of people.</p></div></details>';
@@ -1214,6 +1217,7 @@ function salesqlSettingsForm(search, sizes) {
 }
 
 let _salesqlSettingsOpen = false;
+let _salesqlNotes = [];
 
 async function saveSalesqlSettings() {
   const body = {};
@@ -1227,9 +1231,11 @@ async function saveSalesqlSettings() {
   const data = await api('/api/salesql/settings', {
     method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
   });
-  showToast(data && data.success ? 'Search settings saved.'
+  const notes = (data && data.notes) || [];
+  showToast(data && data.success ? 'Search settings saved.' + (notes.length ? ' ' + notes.join(' ') : '')
                                   : (data && data.message) || 'Could not save the settings.',
-            data && data.success ? 'success' : 'error');
+            data && data.success ? (notes.length ? 'error' : 'success') : 'error');
+  _salesqlNotes = notes;
   if (data && data.success) loadSalesql();
 }
 

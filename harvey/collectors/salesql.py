@@ -200,10 +200,12 @@ async def build_filters(client, state, config) -> tuple[dict, list[str]]:
         if value and value not in states:
             states.append(value)
         elif not value:
-            notes.append(f"SalesQL has no state or city called \"{_s(name)}\".")
+            notes.append(f"SalesQL has no state called \"{_s(name)}\".")
     if cfg.states and not states:
-        raise sq.SalesQLError("SalesQL recognised none of salesql.states, so the search "
-                              "would have covered the whole country. Check the names.")
+        raise sq.SalesQLError(
+            "SalesQL doesn't know the state \"" + "\", \"".join(cfg.states) + "\". It lists "
+            "states and regions by full name (California, Massachusetts), not cities. "
+            "Put the state under States and the city under Cities.")
     if states:
         filters["organization_states_or_cities"] = states
         filters["states_or_cities"] = states
@@ -240,6 +242,11 @@ async def build_filters(client, state, config) -> tuple[dict, list[str]]:
                 notes.append(f"SalesQL has no industry matching \"{_s(name)}\".")
         if industries:
             filters["organization_industries"] = industries
+        elif cfg.industries:
+            raise sq.SalesQLError(
+                "SalesQL has none of these industries: " + ", ".join(cfg.industries) + ". "
+                "It uses LinkedIn's industry names (Financial Services, Retail, Real Estate). "
+                "Fix the names, or leave Industries empty to search every industry.")
     return filters, notes
 
 
@@ -295,6 +302,15 @@ async def search(state, config, api_key: str, *, transport=None) -> dict:
         elif found["results"]:
             await state.set_setting(page_key, str(page + 1))
         people = [c for c in (candidate_from_result(r) for r in found["results"]) if c["id"]]
+        cities = [c.lower() for c in cfg.cities if _s(c)]
+        if cities:
+            # SalesQL filters by state only, so the city is matched here,
+            # against the location on each person's profile.
+            inside = [p for p in people if any(c in p["location"].lower() for c in cities)]
+            if len(inside) < len(people):
+                notes.append(f"{len(people) - len(inside)} of {len(people)} were outside "
+                             + ", ".join(cfg.cities) + " and were left out.")
+            people = inside
         sizes = set(filters.get("organization_employee_ranges") or [])
         tech = cfg.technical_words
         counts: dict[str, int | None] = {}
@@ -332,7 +348,7 @@ def _usage_key() -> str:
 
 
 SEARCH_KEY = "salesql:search_settings"
-LIST_FIELDS = ("job_titles", "company_sizes", "countries", "states", "industries",
+LIST_FIELDS = ("job_titles", "company_sizes", "countries", "states", "cities", "industries",
                "company_keywords")
 MAX_LIST = 30
 
@@ -347,6 +363,7 @@ async def search_settings(state, config) -> dict:
         or sizes_for(icp.company_size),
         "countries": list(cfg.countries or icp.geography),
         "states": list(cfg.states),
+        "cities": list(cfg.cities),
         "industries": list(cfg.industries or icp.industries),
         "company_keywords": list(cfg.company_keywords),
         "require_no_developers": cfg.require_no_developers,
@@ -409,6 +426,35 @@ async def set_search_settings(state, config, data) -> dict:
     saved = {**(saved if isinstance(saved, dict) else {}), **changes}
     await state.set_setting(SEARCH_KEY, json.dumps(saved))
     return await search_settings(state, config)
+
+
+async def check_names(state, config, api_key: str, *, transport=None) -> list[str]:
+    """What SalesQL makes of the saved states, countries and industries: one
+    line per name it doesn't know or reads as something else. Free."""
+    values = await search_settings(state, config)
+    notes: list[str] = []
+    async with sq.SalesQL(api_key, transport=transport) as client:
+        for field, kind, word in (("states", "region", "state"), ("countries", "country", "country"),
+                                  ("industries", "industry", "industry")):
+            for name in values[field]:
+                if kind == "country":
+                    name = COUNTRY_ALIASES.get(name.lower(), name)
+                found = await client.lookup(kind, q=name, size=10)
+                labels = [v["label"] for v in found]
+                if any(label.lower() == name.lower() for label in labels):
+                    continue
+                if kind == "industry" and labels:
+                    notes.append(f"Industry \"{name}\" will be read as \"{labels[0]}\""
+                                 + (f" (others: {', '.join(labels[1:4])})" if labels[1:] else "")
+                                 + ".")
+                elif labels:
+                    notes.append(f"SalesQL has no {word} called \"{name}\". "
+                                 f"Closest: {', '.join(labels[:4])}.")
+                else:
+                    notes.append(f"SalesQL has no {word} called \"{name}\"."
+                                 + (" It lists states, not cities: put a city under Cities."
+                                    if kind == "region" else ""))
+    return notes
 
 
 async def _with_search_settings(state, config):
