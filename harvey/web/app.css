@@ -1170,3 +1170,5 @@ a.btn, a.btn:hover { text-decoration: none; }
   background: var(--surface); border-radius: var(--r-lg); box-shadow: var(--shadow-pop);
 }
 .sq-actions-n { flex: 1; font-size: var(--fs-ui); color: var(--text-2); }
+.sq-describe { margin-bottom: var(--sp-4); }
+.sq-describe textarea.form-input { height: auto; min-height: 76px; padding: 10px 12px; line-height: 1.5; resize: vertical; }
