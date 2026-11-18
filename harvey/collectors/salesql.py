@@ -24,6 +24,7 @@ import hashlib
 import json
 import logging
 import re
+import uuid
 from datetime import datetime, timezone
 
 from harvey.integrations import salesql as sq
@@ -85,27 +86,19 @@ def technical_word(text: str, words) -> str:
 
 def grade_candidate(person: dict, *, technical_words, allowed_sizes, dev_count,
                     require_no_developers: bool = True) -> tuple[str, str]:
-    """(grade, reason) for one candidate. ``dev_count`` is None when the
-    company wasn't checked."""
-    word = technical_word(person.get("title", ""), technical_words) \
-        or technical_word(person.get("headline", ""), technical_words)
-    if word:
-        return "rejected", f"Looks technical: \"{word}\" in the title or headline."
-    if not person.get("org_uuid"):
-        return "unsure", "SalesQL has no company record for this person."
-    if not person.get("has_work_email"):
-        return "rejected", "SalesQL has no work email for this person."
-    if allowed_sizes and person.get("org_size") and person["org_size"] not in allowed_sizes:
-        return "unsure", (f"Their main company is {person['org_size']} people, outside the "
-                          "size you asked for.")
-    if not require_no_developers:
-        return "qualified", "Matches the title, company size and location."
-    if dev_count is None:
-        return "unsure", "The company wasn't checked for software staff yet."
-    if dev_count > 0:
-        return "rejected", (f"{dev_count} {'person' if dev_count == 1 else 'people'} with a "
-                            "software job title at the company.")
-    return "qualified", "No software job titles found at the company."
+    """(grade, reason) under the rules harvey.yaml describes. ``dev_count`` is
+    None when the company wasn't checked."""
+    rules: list[dict] = []
+    if technical_words:
+        rules.append({"id": "not-technical", "kind": "person_words",
+                      "where": "title_or_headline", "mode": "has_none",
+                      "words": list(technical_words)})
+    staff = {}
+    if require_no_developers:
+        rules.append({"id": "no-developers", "kind": "company_staff", "mode": "none",
+                      "label": "software", "titles": ["-"]})
+        staff = {"no-developers": {person.get("org_uuid"): dev_count}}
+    return grade_by_rules(person, rules, allowed_sizes=allowed_sizes, staff=staff)
 
 
 def _size_label(raw: str) -> str:
@@ -162,9 +155,238 @@ async def _lookup(client, state, kind: str, name: str) -> str:
     return chosen["value"] if chosen else ""
 
 
-async def build_filters(client, state, config) -> tuple[dict, list[str]]:
+# ── rules: who counts as a good prospect, kept as data, not code ──
+#
+# A rule is one of three kinds:
+#   person_words   text on the person or their company must contain, or must
+#                  not contain, any of some words
+#   company_staff  the company must have nobody, or somebody, with certain job
+#                  titles (a free extra search per ten companies)
+#   filter         one of SalesQL's own search filters
+# Rules are edited on the dashboard and saved in the database. Until any are
+# saved, the rules are worked out from harvey.yaml (salesql.technical_words,
+# developer_titles, require_no_developers), which is what Harvey did before.
+
+RULES_KEY = "salesql:rules"
+MAX_RULES = 20
+WHERE = {"title": "job title", "headline": "headline",
+         "title_or_headline": "job title or headline", "location": "location",
+         "company_name": "company name", "company_industry": "company industry"}
+# filter name -> (SalesQL field, how the value is sent)
+FILTERS = {
+    "has_phone": ("has_phones", "flag"),
+    "has_work_phone": ("has_work_phones", "flag"),
+    "has_verified_email": ("has_emails_verified", "flag"),
+    "founded_from": ("organization_founded_years", "gte"),
+    "founded_to": ("organization_founded_years", "lte"),
+    "experience_min": ("years_experience_total", "gte"),
+    "experience_max": ("years_experience_total", "lte"),
+    "in_role_min": ("years_in_current_position", "gte"),
+    "in_role_max": ("years_in_current_position", "lte"),
+    "exclude_titles": ("job_titles", "exclude"),
+    "exclude_past_titles": ("past_job_titles", "exclude"),
+    "past_titles": ("past_job_titles", "include"),
+}
+FILTER_LABELS = {
+    "has_phone": "Has a phone number", "has_work_phone": "Has a work phone number",
+    "has_verified_email": "Has an email SalesQL verified",
+    "founded_from": "Company founded in or after (year)",
+    "founded_to": "Company founded in or before (year)",
+    "experience_min": "Years of experience, at least",
+    "experience_max": "Years of experience, at most",
+    "in_role_min": "Years in the current job, at least",
+    "in_role_max": "Years in the current job, at most",
+    "exclude_titles": "Leave out anyone whose job title has",
+    "exclude_past_titles": "Leave out anyone who ever held a job title with",
+    "past_titles": "Only people who once held a job title with",
+}
+
+
+def _words(values, what: str) -> list[str]:
+    if not isinstance(values, list) or not values or len(values) > 40 \
+            or not all(isinstance(v, str) and len(v) <= 80 for v in values):
+        raise ValueError(f"{what}: give 1 to 40 entries of at most 80 characters each.")
+    out = list(dict.fromkeys(re.sub(r"\s+", " ", v).strip() for v in values if v.strip()))
+    if not out:
+        raise ValueError(f"{what}: give at least one entry.")
+    return out
+
+
+def clean_rules(data) -> list[dict]:
+    """The rules in ``data``, checked. Raises ValueError a person can act on."""
+    if not isinstance(data, list) or len(data) > MAX_RULES:
+        raise ValueError(f"Send up to {MAX_RULES} rules as a list.")
+    out: list[dict] = []
+    for n, raw in enumerate(data, start=1):
+        if not isinstance(raw, dict):
+            raise ValueError(f"Rule {n} isn't readable.")
+        kind = raw.get("kind")
+        rule: dict = {"id": _s(raw.get("id"))[:40] or f"rule-{uuid.uuid4().hex[:8]}",
+                      "kind": kind}
+        if kind == "person_words":
+            if raw.get("where") not in WHERE or raw.get("mode") not in ("has_any", "has_none"):
+                raise ValueError(f"Rule {n}: choose where to look and whether the words "
+                                 "must or must not appear.")
+            rule.update(where=raw["where"], mode=raw["mode"],
+                        words=_words(raw.get("words"), f"Rule {n}, words"))
+        elif kind == "company_staff":
+            if raw.get("mode") not in ("none", "some"):
+                raise ValueError(f"Rule {n}: choose nobody or at least one person.")
+            label = re.sub(r"\s+", " ", _s(raw.get("label")))[:30]
+            rule.update(mode=raw["mode"], label=label or "these",
+                        titles=_words(raw.get("titles"), f"Rule {n}, job titles"))
+        elif kind == "filter":
+            name = raw.get("filter")
+            if name not in FILTERS:
+                raise ValueError(f"Rule {n}: that search filter isn't one Harvey knows.")
+            how = FILTERS[name][1]
+            value = raw.get("value")
+            if how == "flag":
+                value = True
+            elif how in ("gte", "lte"):
+                if isinstance(value, str) and value.strip().isdigit():
+                    value = int(value.strip())
+                if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 2100:
+                    raise ValueError(f"Rule {n}: give a whole number.")
+            else:
+                value = _words(value, f"Rule {n}, job titles")
+            rule.update(filter=name, value=value)
+        else:
+            raise ValueError(f"Rule {n}: unknown kind of rule.")
+        out.append(rule)
+    if len({r["id"] for r in out}) != len(out):
+        raise ValueError("Two rules have the same id.")
+    return out
+
+
+def default_rules(cfg) -> list[dict]:
+    """The rules harvey.yaml describes, for when none were saved."""
+    rules: list[dict] = []
+    tech = [w for w in cfg.technical_words if _s(w)]
+    if tech:
+        rules.append({"id": "not-technical", "kind": "person_words",
+                      "where": "title_or_headline", "mode": "has_none", "words": tech})
+        rules.append({"id": "never-technical", "kind": "filter", "filter": "exclude_past_titles",
+                      "value": [t for t in cfg.developer_titles if _s(t)] or tech})
+    if cfg.require_no_developers and [t for t in cfg.developer_titles if _s(t)]:
+        rules.append({"id": "no-developers", "kind": "company_staff", "mode": "none",
+                      "label": "software", "titles": [t for t in cfg.developer_titles if _s(t)]})
+    return rules
+
+
+async def get_rules(state, config) -> list[dict]:
+    raw = await state.get_setting(RULES_KEY, "")
+    if raw:
+        try:
+            return clean_rules(json.loads(raw))
+        except ValueError:
+            logger.warning("Saved SalesQL rules couldn't be read; using harvey.yaml.")
+    return default_rules(config.salesql)
+
+
+async def set_rules(state, data) -> list[dict]:
+    rules = clean_rules(data)
+    await state.set_setting(RULES_KEY, json.dumps(rules))
+    return rules
+
+
+def describe_rule(rule: dict) -> str:
+    """One rule in a sentence."""
+    if rule["kind"] == "person_words":
+        verb = "must mention one of" if rule["mode"] == "has_any" else "must not mention"
+        return f"The {WHERE[rule['where']]} {verb}: {', '.join(rule['words'])}."
+    if rule["kind"] == "company_staff":
+        who = "nobody" if rule["mode"] == "none" else "at least one person"
+        return (f"The company must have {who} with a {rule['label']} job title "
+                f"({', '.join(rule['titles'])}).")
+    label = FILTER_LABELS[rule["filter"]]
+    value = rule["value"]
+    if value is True:
+        return label + "."
+    return f"{label}: {', '.join(value) if isinstance(value, list) else value}."
+
+
+def _rule_filters(rules: list[dict], filters: dict) -> None:
+    """Lay the 'filter' rules over the search filters."""
+    for rule in rules:
+        if rule["kind"] != "filter":
+            continue
+        field, how = FILTERS[rule["filter"]]
+        if how == "flag":
+            filters[field] = True
+        elif how in ("gte", "lte"):
+            filters[field] = {**_d(filters.get(field)), how: rule["value"]}
+        else:
+            current = filters.get(field)
+            current = {"include": current} if isinstance(current, list) else _d(current)
+            merged = list(dict.fromkeys(_l(current.get(how)) + rule["value"]))
+            filters[field] = {**current, how: merged}
+
+
+def _person_text(person: dict, where: str) -> str:
+    return {"title": person.get("title", ""), "headline": person.get("headline", ""),
+            "title_or_headline": f"{person.get('title', '')} \n {person.get('headline', '')}",
+            "location": person.get("location", ""), "company_name": person.get("org_name", ""),
+            "company_industry": person.get("org_industry", "")}[where]
+
+
+def grade_by_rules(person: dict, rules: list[dict], *, allowed_sizes,
+                   staff: dict[str, dict]) -> tuple[str, str]:
+    """(grade, reason) for one candidate under ``rules``. ``staff`` holds, per
+    company_staff rule id, {org_uuid: count or None}; a rule missing from it
+    is taken as passed (used to see who is still worth a company check)."""
+    for rule in rules:
+        if rule["kind"] != "person_words":
+            continue
+        text = _person_text(person, rule["where"])
+        word = technical_word(text, rule["words"])
+        if rule["mode"] == "has_none" and word:
+            if rule["where"] == "title_or_headline" and rule["id"] == "not-technical":
+                return "rejected", f"Looks technical: \"{word}\" in the title or headline."
+            return "rejected", f"\"{word}\" in the {WHERE[rule['where']]}."
+        if rule["mode"] == "has_any" and not word:
+            return "rejected", (f"The {WHERE[rule['where']]} mentions none of: "
+                                f"{', '.join(rule['words'][:5])}.")
+    if not person.get("org_uuid"):
+        return "unsure", "SalesQL has no company record for this person."
+    if not person.get("has_work_email"):
+        return "rejected", "SalesQL has no work email for this person."
+    if allowed_sizes and person.get("org_size") and person["org_size"] not in allowed_sizes:
+        return "unsure", (f"Their main company is {person['org_size']} people, outside the "
+                          "size you asked for.")
+    passed: list[str] = []
+    unsure = ""
+    for rule in rules:
+        if rule["kind"] != "company_staff" or rule["id"] not in staff:
+            continue
+        count = staff[rule["id"]].get(person["org_uuid"])
+        label = rule["label"]
+        if count is None:
+            unsure = unsure or f"The company wasn't checked for {label} staff yet."
+        elif rule["mode"] == "none" and count > 0:
+            return "rejected", (f"{count} {'person' if count == 1 else 'people'} with a "
+                                f"{label} job title at the company.")
+        elif rule["mode"] == "some" and count == 0:
+            return "rejected", f"Nobody with a {label} job title at the company."
+        elif rule["mode"] == "none":
+            passed.append(f"No {label} job titles found at the company.")
+        else:
+            passed.append(f"{count} with a {label} job title at the company.")
+    if unsure:
+        return "unsure", unsure
+    return "qualified", " ".join(passed) or "Matches the title, company size and location."
+
+
+def _l(x) -> list:
+    return x if isinstance(x, list) else []
+
+
+async def build_filters(client, state, config, rules: list[dict] | None = None
+                        ) -> tuple[dict, list[str]]:
     """The people-search filters for this config, and notes on anything left out."""
     cfg, icp = config.salesql, config.icp
+    if rules is None:
+        rules = default_rules(cfg)
     notes: list[str] = []
     filters: dict = {}
 
@@ -172,10 +394,8 @@ async def build_filters(client, state, config) -> tuple[dict, list[str]]:
     if not titles:
         raise sq.SalesQLError("No job titles to search for. Set icp.titles or "
                               "salesql.job_titles in harvey.yaml.")
-    tech = [w for w in cfg.technical_words if _s(w)]
     filters["job_titles"] = {"include": titles}
-    if tech:
-        filters["past_job_titles"] = {"exclude": cfg.developer_titles or tech}
+    _rule_filters(rules, filters)
 
     sizes = [s for s in cfg.company_sizes if s in {r[0] for r in SIZE_RANGES}] \
         or sizes_for(icp.company_size)
@@ -287,7 +507,8 @@ async def search(state, config, api_key: str, *, transport=None) -> dict:
     config = await _with_search_settings(state, config)
     cfg = config.salesql
     async with sq.SalesQL(api_key, transport=transport) as client:
-        filters, notes = await build_filters(client, state, config)
+        rules = await get_rules(state, config)
+        filters, notes = await build_filters(client, state, config, rules)
         # Each search with the same settings reads the next page, so pressing
         # Search again brings new people, not the same ones.
         page_key = "salesql:page:" + hashlib.sha256(
@@ -312,26 +533,29 @@ async def search(state, config, api_key: str, *, transport=None) -> dict:
                              + ", ".join(cfg.cities) + " and were left out.")
             people = inside
         sizes = set(filters.get("organization_employee_ranges") or [])
-        tech = cfg.technical_words
-        counts: dict[str, int | None] = {}
-        if cfg.require_no_developers:
+        staff_rules = [r for r in rules if r["kind"] == "company_staff"]
+        staff: dict[str, dict] = {}
+        if staff_rules:
             # Only companies whose candidate could still qualify are worth a check.
             orgs = []
             for p in people:
-                grade, _ = grade_candidate(p, technical_words=tech, allowed_sizes=sizes,
-                                           dev_count=0, require_no_developers=True)
+                grade, _ = grade_by_rules(p, rules, allowed_sizes=sizes, staff={})
                 if grade == "qualified" and p["org_uuid"] not in orgs:
                     orgs.append(p["org_uuid"])
-            if orgs:
-                counts = await count_developers(client, orgs, cfg.developer_titles)
+            for rule in staff_rules:
+                staff[rule["id"]] = await count_developers(client, orgs, rule["titles"]) \
+                    if orgs else {}
+                # A later rule only needs the companies still in the running.
+                orgs = [o for o in orgs if not (
+                    (rule["mode"] == "none" and (staff[rule["id"]].get(o) or 0) > 0)
+                    or (rule["mode"] == "some" and staff[rule["id"]].get(o) == 0))]
 
     summary = {"found": len(people), "total": found["total"], "new": 0,
                "qualified": 0, "unsure": 0, "rejected": 0, "notes": notes}
+    counted = next((r["id"] for r in staff_rules if r["mode"] == "none"), "")
     for p in people:
-        dev_count = counts.get(p["org_uuid"])
-        grade, reason = grade_candidate(
-            p, technical_words=tech, allowed_sizes=sizes, dev_count=dev_count,
-            require_no_developers=cfg.require_no_developers)
+        grade, reason = grade_by_rules(p, rules, allowed_sizes=sizes, staff=staff)
+        dev_count = staff.get(counted, {}).get(p["org_uuid"]) if counted else None
         p.update(grade=grade, reason=reason, dev_count=dev_count)
         if await state.upsert_salesql_candidate(p):
             summary["new"] += 1

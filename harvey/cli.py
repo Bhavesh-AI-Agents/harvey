@@ -921,6 +921,25 @@ def cmd_salesql(args):
                   f"{account['credits']} credits left.\n")
             return 0
 
+        if action == "rules":
+            import json as _json
+            try:
+                config = load_config()
+            except ConfigError as e:
+                print(f"\n  {e}\n")
+                return 1
+            if args.set:
+                try:
+                    await collector.set_rules(state, _json.loads(args.set))
+                except ValueError as e:
+                    print(f"\n  {e}\n")
+                    return 1
+            rules = await collector.get_rules(state, config)
+            for r in rules:
+                print("  - " + collector.describe_rule(r))
+            print(_json.dumps(rules, indent=2))
+            return 0
+
         if action == "settings":
             import json as _json
             try:
@@ -1293,11 +1312,12 @@ def main():
     sub = subparsers.add_parser(
         "salesql", help="Find people through SalesQL: search (free), then reveal the ones you pick")
     sub.add_argument("salesql_action", nargs="?", default="status",
-                     choices=["status", "connect", "settings", "search", "list", "reveal"],
+                     choices=["status", "connect", "settings", "rules", "search", "list", "reveal"],
                      help="show the status (default), connect a key, show or change who a "
                           "search looks for, search, list who was found, or reveal contacts")
     sub.add_argument("--set", default="", metavar="JSON",
-                     help='settings: change them, e.g. --set \'{"states": ["California"]}\'')
+                     help='settings or rules: change them, e.g. settings --set \'{"states": '
+                          '["California"]}\'; rules --set takes the whole list of rules')
     sub.add_argument("ids", nargs="*", help="reveal: ids from 'harvey salesql list'")
     sub.add_argument("--qualified", action="store_true",
                      help="reveal: everyone graded qualified")

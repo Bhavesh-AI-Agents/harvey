@@ -756,6 +756,8 @@ salesql:
 
 The same settings can be changed without editing the file: on the dashboard under **Discover → People, through SalesQL → Who to search for**, or with `harvey salesql settings --set '{"states": ["California"]}'` (`harvey salesql settings` prints them). Values saved that way win over the file. Pressing Search again with unchanged settings reads the next page of people.
 
+**Rules.** Who counts as a good prospect is a list of rules, edited on the same card (or with `harvey salesql rules --set JSON`), so a new rule needs no code. There are three kinds: words that must or must not appear in the title, headline, location, company name or industry; a company-staff rule (the company must have nobody, or somebody, with given job titles, at one free extra search per ten companies); and SalesQL's own filters (has a phone, years of experience, company founding year, current or past titles to leave out). Until rules are saved, they are worked out from `technical_words`, `developer_titles` and `require_no_developers` below.
+
 An industry filter is broad and noisy (it matches any company a person is attached to). `company_keywords` is usually sharper. Harvey never opens or scrapes linkedin.com: a LinkedIn URL is only an identifier SalesQL returns and accepts.
 
 ### Warmup with TrulyInbox

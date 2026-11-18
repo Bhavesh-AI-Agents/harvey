@@ -1143,7 +1143,7 @@ async function loadSalesql() {
     '<button class="btn btn-secondary btn-sm" onclick="saveSalesqlCap()">Save</button></p>' +
     '<p class="desc" style="margin:6px 0 0">The cap is a safety limit on credits spent in one day. ' +
     'Plan and credits are read from SalesQL each time this card loads and before every reveal.</p>' +
-    salesqlSettingsForm(data.search, data.sizes) +
+    salesqlSettingsForm(data.search, data.sizes, data) +
     '<div class="btn-group" style="margin-top:12px">' +
     '<button class="btn btn-secondary" id="salesql-search" onclick="searchSalesql()"' +
     (_salesqlBusy ? ' disabled' : '') + '>Search (free)</button>' +
@@ -1299,7 +1299,10 @@ function suggestSalesql(field, kind) {
   }, 300);
 }
 
-function salesqlSettingsForm(search, sizes) {
+function salesqlSettingsForm(search, sizes, data) {
+  _sqRules = ((data && data.rules) || []).map(r => ({...r}));
+  _sqRuleOptions = (data && data.rule_options) || {where: {}, filters: {}};
+  const seen = (data && data.titles_seen) || [];
   if (!search) return '';
   const open = _salesqlSettingsOpen ? ' open' : '';
   let html = '<details id="salesql-settings" style="margin-top:14px"' + open +
@@ -1325,27 +1328,162 @@ function salesqlSettingsForm(search, sizes) {
   ['job_titles', 'countries', 'states', 'cities', 'industries', 'company_keywords'].forEach(field => {
     const t = SALESQL_LISTS.find(x => x[0] === field);
     html += t ? typed(t) : picked(SALESQL_PICKS.find(x => x[0] === field));
+    if (field === 'job_titles') html += salesqlTitleHelp(seen);
   });
   html += '<div class="form-group"><span class="form-label">Company size (employees)</span><div>' +
     (sizes || []).map(size => '<label style="display:inline-block;margin:0 14px 6px 0">' +
       '<input type="checkbox" class="sq-size" value="' + escHtml(size) + '"' +
       ((search.company_sizes || []).includes(size) ? ' checked' : '') + '> ' + escHtml(size) +
       '</label>').join('') + '</div></div>' +
-    '<div class="form-group"><label><input type="checkbox" id="sq-nodevs"' +
-    (search.require_no_developers ? ' checked' : '') +
-    '> Only companies with no software staff of their own</label></div>' +
+    '<div class="form-group"><span class="form-label">Rules</span>' +
+    '<p class="desc" style="margin:0 0 6px">Every rule must hold for a person to be marked qualified. ' +
+    'Add as many as you need. A company rule runs one extra free search per ten companies.</p>' +
+    '<div id="sq-rules">' + salesqlRulesList() + '</div>' + salesqlRuleAdder() + '</div>' +
     '<div class="form-group"><label class="form-label" for="sq-page">People per search (20 to 100)</label>' +
     '<input class="form-input" id="sq-page" type="number" min="20" max="100" style="width:110px" value="' +
     (search.page_size || 20) + '"></div>' +
     (_salesqlNotes.length ? '<div class="banner wait" style="margin-bottom:10px"><div>' +
       _salesqlNotes.map(n => '<p style="margin:0 0 4px">' + escHtml(n) + '</p>').join('') + '</div></div>' : '') +
-    '<button class="btn btn-secondary btn-sm" onclick="saveSalesqlSettings()">Save search settings</button>' +
+    '<button class="btn btn-primary btn-sm" onclick="saveSalesqlSettings()">Save search settings</button>' +
     '<p class="desc" style="margin:8px 0 0">Saved here, these replace the values in harvey.yaml. ' +
     'Pressing Search again with the same settings brings the next group of people.</p></div></details>';
   return html;
 }
 
 let _salesqlSettingsOpen = false;
+let _sqRules = [];
+let _sqRuleOptions = {where: {}, filters: {}};
+
+// SalesQL has no list of job titles: it matches whatever words you give
+// against people's titles. These are common ones to start from.
+const SALESQL_TITLE_IDEAS = ['Founder', 'Co-Founder', 'Owner', 'Co-Owner', 'CEO',
+  'Chief Executive Officer', 'President', 'Managing Director', 'Managing Partner', 'Partner',
+  'Principal', 'Proprietor', 'General Manager', 'Director', 'Vice President', 'Head of Operations',
+  'Operations Manager', 'Office Manager', 'Marketing Manager', 'Sales Manager'];
+
+function salesqlTitleHelp(seen) {
+  const tag = name => '<a href="#" class="tag" style="margin:0 6px 6px 0" data-title="' + escHtml(name) +
+    '" onclick="addSalesqlTitle(this.dataset.title);return false">+ ' + escHtml(name) + '</a>';
+  return '<div class="form-group" style="margin-top:-6px"><p class="desc" style="margin:0 0 6px">' +
+    'SalesQL has no fixed list of titles. It finds people whose title contains your words, so ' +
+    '"Owner" also finds "Co-Owner" and "Owner & CEO". Common titles:</p>' +
+    SALESQL_TITLE_IDEAS.map(tag).join('') +
+    (seen.length ? '<p class="desc" style="margin:6px 0">Titles on people your searches found:</p>' +
+      seen.map(tag).join('') : '') + '</div>';
+}
+
+function addSalesqlTitle(name) {
+  const el = document.getElementById('sq-job_titles');
+  if (!el) return;
+  const have = el.value.split(',').map(v => v.trim()).filter(Boolean);
+  if (!have.some(v => v.toLowerCase() === name.toLowerCase())) have.push(name);
+  el.value = have.join(', ');
+}
+
+function salesqlRulesList() {
+  if (!_sqRules.length) return '<p class="muted" style="margin:0 0 8px">No rules: everyone the search finds is qualified.</p>';
+  return _sqRules.map((rule, i) => '<div style="display:flex;gap:10px;align-items:flex-start;margin:0 0 6px">' +
+    '<span style="flex:1">' + escHtml(rule.text || salesqlRuleText(rule)) + '</span>' +
+    '<button class="btn btn-secondary btn-sm" onclick="removeSalesqlRule(' + i + ')">Remove</button></div>').join('');
+}
+
+function salesqlRuleText(rule) {
+  const o = _sqRuleOptions;
+  if (rule.kind === 'person_words') {
+    return 'The ' + (o.where[rule.where] || rule.where) + (rule.mode === 'has_any' ? ' must mention one of: '
+      : ' must not mention: ') + rule.words.join(', ') + '.';
+  }
+  if (rule.kind === 'company_staff') {
+    return 'The company must have ' + (rule.mode === 'none' ? 'nobody' : 'at least one person') +
+      ' with a ' + rule.label + ' job title (' + rule.titles.join(', ') + ').';
+  }
+  const f = o.filters[rule.filter] || {label: rule.filter};
+  return f.label + (rule.value === true ? '' : ': ' + (Array.isArray(rule.value) ? rule.value.join(', ') : rule.value)) + '.';
+}
+
+function removeSalesqlRule(i) {
+  _sqRules.splice(i, 1);
+  const el = document.getElementById('sq-rules');
+  if (el) el.innerHTML = salesqlRulesList();
+}
+
+function salesqlRuleAdder() {
+  const o = _sqRuleOptions;
+  const where = Object.keys(o.where).map(k => '<option value="' + k + '">' + escHtml(o.where[k]) + '</option>').join('');
+  const filters = Object.keys(o.filters).map(k => '<option value="' + k + '">' + escHtml(o.filters[k].label) + '</option>').join('');
+  return '<div style="border:1px solid var(--line);border-radius:8px;padding:10px;margin-top:8px">' +
+    '<label class="form-label" for="sq-rule-kind">Add a rule</label>' +
+    '<select class="form-input" id="sq-rule-kind" onchange="showSalesqlRuleFields()" style="margin-bottom:8px">' +
+    '<option value="person_words">About the person or company: words that must or must not appear</option>' +
+    '<option value="company_staff">About the company\'s staff: nobody, or somebody, with certain job titles</option>' +
+    '<option value="filter">A SalesQL search filter (phone, experience, company age, past titles)</option></select>' +
+    '<div id="sq-rule-person_words"><select class="form-input" id="sq-rule-where" style="margin-bottom:6px">' + where + '</select>' +
+      '<select class="form-input" id="sq-rule-mode-words" style="margin-bottom:6px">' +
+      '<option value="has_none">must not mention any of these words</option>' +
+      '<option value="has_any">must mention at least one of these words</option></select>' +
+      '<input class="form-input" id="sq-rule-words" type="text" autocomplete="off" placeholder="Words, with commas between them"></div>' +
+    '<div id="sq-rule-company_staff" style="display:none"><select class="form-input" id="sq-rule-mode-staff" style="margin-bottom:6px">' +
+      '<option value="none">The company must have nobody with these job titles</option>' +
+      '<option value="some">The company must have at least one person with these job titles</option></select>' +
+      '<input class="form-input" id="sq-rule-titles" type="text" autocomplete="off" style="margin-bottom:6px" ' +
+      'placeholder="Job titles, with commas: Marketing Manager, Head of Marketing">' +
+      '<input class="form-input" id="sq-rule-label" type="text" autocomplete="off" maxlength="30" ' +
+      'placeholder="One word for these people, e.g. marketing (used in the reason shown)"></div>' +
+    '<div id="sq-rule-filter" style="display:none"><select class="form-input" id="sq-rule-filter-name" ' +
+      'onchange="showSalesqlRuleFields()" style="margin-bottom:6px">' + filters + '</select>' +
+      '<input class="form-input" id="sq-rule-value" type="text" autocomplete="off"></div>' +
+    '<button class="btn btn-secondary btn-sm" style="margin-top:8px" onclick="addSalesqlRule()">Add rule</button></div>';
+}
+
+function showSalesqlRuleFields() {
+  const kind = (document.getElementById('sq-rule-kind') || {}).value;
+  ['person_words', 'company_staff', 'filter'].forEach(k => {
+    const el = document.getElementById('sq-rule-' + k);
+    if (el) el.style.display = k === kind ? '' : 'none';
+  });
+  const name = (document.getElementById('sq-rule-filter-name') || {}).value;
+  const takes = ((_sqRuleOptions.filters[name] || {}).takes) || '';
+  const value = document.getElementById('sq-rule-value');
+  if (value) {
+    value.style.display = takes === 'flag' ? 'none' : '';
+    value.placeholder = (takes === 'gte' || takes === 'lte') ? 'A whole number' : 'Job titles, with commas between them';
+  }
+}
+
+function addSalesqlRule() {
+  const val = id => ((document.getElementById(id) || {}).value || '').trim();
+  const list = id => val(id).split(',').map(v => v.trim()).filter(Boolean);
+  const kind = val('sq-rule-kind');
+  let rule = null, problem = '';
+  if (kind === 'person_words') {
+    rule = {kind, where: val('sq-rule-where'), mode: val('sq-rule-mode-words'), words: list('sq-rule-words')};
+    if (!rule.words.length) problem = 'Give at least one word.';
+  } else if (kind === 'company_staff') {
+    rule = {kind, mode: val('sq-rule-mode-staff'), titles: list('sq-rule-titles'), label: val('sq-rule-label') || 'these'};
+    if (!rule.titles.length) problem = 'Give at least one job title.';
+  } else {
+    const name = val('sq-rule-filter-name');
+    const takes = (_sqRuleOptions.filters[name] || {}).takes;
+    rule = {kind: 'filter', filter: name, value: true};
+    if (takes === 'gte' || takes === 'lte') {
+      rule.value = parseInt(val('sq-rule-value'), 10);
+      if (!Number.isInteger(rule.value) || rule.value < 0) problem = 'Give a whole number.';
+    } else if (takes !== 'flag') {
+      rule.value = list('sq-rule-value');
+      if (!rule.value.length) problem = 'Give at least one job title.';
+    }
+  }
+  if (problem) { showToast(problem, 'error'); return; }
+  if (_sqRules.length >= 20) { showToast('Harvey keeps at most 20 rules.', 'error'); return; }
+  _sqRules.push(rule);
+  const el = document.getElementById('sq-rules');
+  if (el) el.innerHTML = salesqlRulesList();
+  ['sq-rule-words', 'sq-rule-titles', 'sq-rule-label', 'sq-rule-value'].forEach(id => {
+    const input = document.getElementById(id);
+    if (input) input.value = '';
+  });
+  showToast('Rule added. Press Save search settings to keep it.', 'success');
+}
 let _salesqlNotes = [];
 
 async function saveSalesqlSettings() {
@@ -1356,11 +1494,21 @@ async function saveSalesqlSettings() {
   });
   SALESQL_PICKS.forEach(([field]) => { body[field] = (_sqPicked[field] || []).slice(); });
   body.company_sizes = [...document.querySelectorAll('.sq-size:checked')].map(c => c.value);
-  body.require_no_developers = !!(document.getElementById('sq-nodevs') || {}).checked;
   body.page_size = parseInt((document.getElementById('sq-page') || {}).value, 10);
   const data = await api('/api/salesql/settings', {
     method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
   });
+  let rulesSaved = null;
+  if (data && data.success) {
+    rulesSaved = await api('/api/salesql/rules', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({rules: _sqRules.map(({text, ...rule}) => rule)}),
+    });
+    if (!rulesSaved || !rulesSaved.success) {
+      showToast((rulesSaved && rulesSaved.message) || 'Could not save the rules.', 'error');
+      return;
+    }
+  }
   const notes = (data && data.notes) || [];
   showToast(data && data.success ? 'Search settings saved.' + (notes.length ? ' ' + notes.join(' ') : '')
                                   : (data && data.message) || 'Could not save the settings.',

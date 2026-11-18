@@ -161,3 +161,19 @@ def test_the_lists_are_served_and_collecting_starts_once_connected(client, monke
     after = client.get("/api/salesql/catalog").json()
     assert started == ["sq_abc"]                                   # not started again at once
     assert after["collecting"] is False and "tomorrow" in after["note"]
+
+
+def test_rules_are_shown_saved_and_checked(client):
+    shown = client.get("/api/salesql").json()
+    assert shown["rules"] and all(r["text"] for r in shown["rules"])
+    assert "title" in shown["rule_options"]["where"]
+    assert shown["rule_options"]["filters"]["has_phone"]["takes"] == "flag"
+    r = client.post("/api/salesql/rules", json={"rules": [
+        {"kind": "company_staff", "mode": "none", "label": "marketing",
+         "titles": ["Marketing Manager"]}]})
+    assert r.status_code == 200 and "marketing job title" in r.json()["rules"][0]["text"]
+    again = client.get("/api/salesql").json()["rules"]
+    assert len(again) == 1 and again[0]["id"].startswith("rule-")
+    assert client.post("/api/salesql/rules", json={"rules": []}).json()["rules"] == []
+    bad = client.post("/api/salesql/rules", json={"rules": [{"kind": "filter", "filter": "x"}]})
+    assert bad.status_code == 400 and "search filter" in bad.json()["message"]
