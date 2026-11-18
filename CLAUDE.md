@@ -294,6 +294,7 @@ Users will come back with questions and tasks. Common ones:
 - **"I want to change what Harvey says"** → Skills are in `skills/`, prompts are in `prompts/`. Both are plain markdown files. Edit them directly.
 - **"Train Harvey on a different product"** → `harvey train <new-url>`
 - **"How do I see the database?"** → It's at `data/harvey.db`. They can open it with any SQLite tool, or ask you to query it.
+- **"I want to send more" / "add another mailbox"** → Don't raise one mailbox past about 50 cold emails a day. Add mailboxes instead: dashboard → Settings → Sending mailboxes (README, "Sending from several mailboxes"). Each needs a real person's name, never an invented one. The user signs each in with Google themselves; don't ask for passwords or tokens.
 - **"I want to find people by job title, not by company"** → SalesQL (README, "Finding people with SalesQL"). Have them run `harvey salesql connect` in their own terminal (don't ask for the key in chat), then `harvey salesql search` (free) and `harvey salesql list`. Revealing spends their SalesQL credits, one per person: never run `harvey salesql reveal` unless they named who to reveal or said to reveal the qualified ones, and tell them the number first.
 - **"I just want the prospect list"** → `harvey export` writes a sequencer-ready CSV (verified/risky emails only; `--all` for everything). Also available as Export buttons on the dashboard's Contacts tab. Harvey is valuable purely as a list-builder even if the user never lets it send.
 

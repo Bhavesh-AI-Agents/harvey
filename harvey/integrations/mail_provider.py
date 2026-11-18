@@ -45,6 +45,8 @@ class InboundMessage:
     date: str = ""
     is_bounce: bool = False
     headers: dict = field(default_factory=dict)
+    # Which of several sending mailboxes it arrived in ("" with one mailbox).
+    mailbox: str = ""
 
 
 BOUNCE_SENDERS = ("mailer-daemon", "postmaster", "mail delivery subsystem")
@@ -151,7 +153,12 @@ def get_mail_provider(config, env) -> MailProvider | None:
     """Build the configured native provider, or None for instantly/unknown."""
     provider = (config.channels.email.provider or "").strip().lower()
     if provider == "gmail":
-        from harvey.integrations.gmail import GmailProvider
+        from harvey import mailboxes
+        from harvey.integrations.gmail import GmailPool, GmailProvider
+        # A sending list (Settings > Sending mailboxes) takes over from the
+        # single mailbox in persona.email.
+        if mailboxes.load():
+            return GmailPool(config, env)
         return GmailProvider(config, env)
     if provider == "smtp":
         from harvey.integrations.smtp_mail import SmtpImapProvider

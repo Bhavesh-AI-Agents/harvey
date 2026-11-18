@@ -22,6 +22,7 @@ from harvey.config import (
     HarveyConfig, EnvConfig, cold_daily_cap, compliance_footer_lines, compliance_notice,
     compliance_of, live_do_not_contact, operator_timezone, send_window_of,
 )
+from harvey import mailboxes
 from harvey.gate import autopilot_review, do_not_contact_match, pre_send_check
 from harvey.send_window import in_window, next_send_time, recipient_country, recipient_zone
 from harvey.integrations.instantly import InstantlyClient
@@ -115,6 +116,63 @@ class Sender:
             and self.provider is not None
         )
 
+    # ── Several sending mailboxes (harvey/mailboxes.py) ──
+
+    @property
+    def _pool(self):
+        """The mailbox pool when a sending list exists, else None."""
+        return self.provider if getattr(self.provider, "is_pool", False) else None
+
+    def _daily_limits(self) -> tuple[int, int]:
+        """(emails a day, cold emails today) across everything Harvey sends
+        from: the mailboxes that can send right now, or the single mailbox."""
+        email = self.config.channels.email
+        pool = self._pool
+        if pool is None:
+            return email.max_daily_sends, cold_daily_cap(email)
+        usable = pool.usable()
+        return (sum(b.daily_limit for b in usable),
+                sum(mailboxes.cold_cap(b, email) for b in usable))
+
+    async def _stage_mailbox(self, prospect_id: str, open_counts: dict):
+        """The mailbox a person's emails are queued for: the one they already
+        hear from, else the least loaded for its size. None: decided at send."""
+        boxes = self._pool.boxes()
+        address = await self.state.prospect_mailbox(prospect_id)
+        if address:
+            return next((b for b in boxes if b.address == address), None)
+        signed_in = [b for b in boxes if self._pool.signed_in(b)]
+        return mailboxes.pick(signed_in, open_counts)
+
+    async def _send_mailbox(self, item: dict, boxes: dict, box_sent: dict) -> str:
+        """The mailbox this email goes out from now, or "" when it must wait:
+        its mailbox is switched off, not signed in, or at today's limit."""
+        address = item.get("from_address") or await self.state.prospect_mailbox(
+            item["prospect_id"])
+        cold = item["kind"] == "sequence"
+        email = self.config.channels.email
+
+        def has_room(box) -> bool:
+            total, cold_sent = box_sent.get(box.address, (0, 0))
+            if total >= box.daily_limit:
+                return False
+            return not cold or cold_sent < mailboxes.cold_cap(box, email)
+
+        if not address:
+            # Queued before the sending list existed: the persona's own
+            # mailbox keeps it when it can, so the signature needn't change.
+            open_counts = await self.state.mailbox_open_counts()
+            own = boxes.get((self.config.persona.email or "").strip().lower())
+            chosen = own if own is not None and has_room(own) else mailboxes.pick(
+                [b for b in boxes.values() if has_room(b)], open_counts)
+            if chosen is None:
+                return ""
+            await self.state.assign_prospect_mailbox(item["prospect_id"], chosen.address)
+            await self.state.update_outbox_item(item["id"], from_address=chosen.address)
+            return chosen.address
+        box = boxes.get(address)
+        return address if box is not None and has_room(box) else ""
+
     async def _send_zone(self, prospect, country: str = "", given: str = "",
                          names: tuple[str, str] = ("", "")) -> str:
         """The time zone this recipient's send window is in: their own when
@@ -207,11 +265,11 @@ class Sender:
             return False
         if not self.provider.is_configured() or await self.state.get_setting(KILL_SWITCH_KEY):
             return False
-        email = self.config.channels.email
-        if email.max_daily_sends - await self.state.count_outbox_sent_today() <= 0:
+        max_daily, cold_cap = self._daily_limits()
+        if max_daily - await self.state.count_outbox_sent_today() <= 0:
             return False
         midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
-        if cold_daily_cap(email) - await self.state.count_outbox_sent_today(
+        if cold_cap - await self.state.count_outbox_sent_today(
                 kind="sequence",
                 since=midnight.astimezone(timezone.utc).replace(tzinfo=None).isoformat()) <= 0:
             return False
@@ -618,6 +676,7 @@ class Sender:
         now = _utcnow()
         seen_emails: set[str] = set()
         window = send_window_of(self.config)
+        open_counts = await self.state.mailbox_open_counts() if self._pool else {}
 
         for prospect_id in campaign.prospect_ids:
             prospect = await self.state.get_prospect(prospect_id)
@@ -639,6 +698,9 @@ class Sender:
             # With a send window, each email is planned for the recipient's
             # office hours; follow-ups keep their delay, then move into it.
             zone = await self._zone_or_default(prospect) if window is not None else ""
+            # One mailbox per person, chosen now so the Outbox shows who it
+            # is from and the email is signed with that sender's name.
+            box = await self._stage_mailbox(prospect.id, open_counts) if self._pool else None
             cumulative_days = 0
             for step in campaign.sequence:
                 cumulative_days += max(0, step.delay_days)
@@ -651,14 +713,19 @@ class Sender:
                     step=step.step,
                     to_email=email,
                     subject=self._render(step.subject, prospect),
-                    body=self._render(step.body, prospect),
+                    body=(mailboxes.resign(self._render(step.body, prospect),
+                                           self.config.persona.name, box)
+                          if box is not None else self._render(step.body, prospect)),
                     send_at=send_at.isoformat(),
                     status=initial_status,
                     provider=self.provider.name,
                     approved_by="" if require_approval else "autopilot",
+                    from_address=box.address if box is not None else "",
                 )
                 if item_id:
                     staged += 1
+                    if box is not None:
+                        open_counts[box.address] = open_counts.get(box.address, 0) + 1
             # Conditional: never overwrite a status set while staging
             # (marked sent by hand, a reply).
             await self.state.queue_prospect_if_unsent(prospect.id)
@@ -696,11 +763,15 @@ class Sender:
             return body
         return body.rstrip() + "\n\n" + footer
 
-    def _outgoing_body(self, item: dict) -> str:
-        """The exact body that goes out: cold email gets the footer, replies don't."""
+    def _outgoing_body(self, item: dict, box=None) -> str:
+        """The exact body that goes out: cold email gets the footer, replies
+        don't. Sent from another person's mailbox, it is signed with their name."""
+        text = item["body"]
+        if box is not None:
+            text = mailboxes.resign(text, self.config.persona.name, box)
         if item["kind"] == "sequence":
-            return self._with_footer(item["body"])
-        return item["body"]
+            return self._with_footer(text)
+        return text
 
     async def _follow_up_order(self, item: dict, prospect=None) -> str | tuple[str, str] | None:
         """For a follow-up: "wait" until the email before it went out and its
@@ -821,7 +892,11 @@ class Sender:
             await self.state.note_sends_held(f"{SIGNATURE_HOLD_PREFIX}{problem}")
             return
 
-        max_daily = self.config.channels.email.max_daily_sends
+        # With a sending list, each mailbox has its own limit and ramp; the
+        # totals here are their sum, and each email is also checked against
+        # its own mailbox below.
+        pool = self._pool
+        max_daily, cold_cap = self._daily_limits()
         sent_today = await self.state.count_outbox_sent_today()
         budget = min(MAX_SENDS_PER_CYCLE, max_daily - sent_today)
         if budget <= 0:
@@ -829,11 +904,13 @@ class Sender:
             return
         # Cold email has its own cap under the warmup ramp; replies don't.
         # Counted from local midnight, the day the ramp counts in.
-        cold_cap = cold_daily_cap(self.config.channels.email)
         midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+        cold_since = midnight.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
         cold_left = cold_cap - await self.state.count_outbox_sent_today(
-            kind="sequence",
-            since=midnight.astimezone(timezone.utc).replace(tzinfo=None).isoformat())
+            kind="sequence", since=cold_since)
+        boxes = {b.address: b for b in pool.usable()} if pool is not None else {}
+        box_sent = await self.state.mailbox_sent_today(cold_since) if pool is not None else {}
+        held_mailbox = 0
 
         now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         # In quiet hours only cold email can go, so only cold email is
@@ -1006,6 +1083,15 @@ class Sender:
                         outside_window += 1
                         continue
 
+            # With several mailboxes: the one this person hears from, if it
+            # can send now. Otherwise the email waits, still approved.
+            from_address = ""
+            if pool is not None:
+                from_address = await self._send_mailbox(item, boxes, box_sent)
+                if not from_address:
+                    held_mailbox += 1
+                    continue
+
             # Claim it. A reply, bounce, hand send or rejection may have
             # cancelled it since the queue was read; then it stays cancelled.
             if not await self.state.claim_outbox_item(item["id"]):
@@ -1023,12 +1109,13 @@ class Sender:
                     item["id"], status=blocked[0], error=blocked[1])
                 continue
 
-            body = self._outgoing_body(item)
+            body = self._outgoing_body(item, boxes.get(from_address))
             try:
                 result = await self.provider.send_email(
                     item["to_email"], item["subject"], body,
                     thread_ref=item.get("thread_ref", ""),
                     in_reply_to=item.get("in_reply_to", ""),
+                    **({"from_address": from_address} if pool is not None else {}),
                 )
             except Exception as e:
                 # It may have gone out before the error: never retry it.
@@ -1054,12 +1141,17 @@ class Sender:
             sent += 1
             if item["kind"] == "sequence":
                 sent_cold += 1
+            if from_address:
+                total, cold_sent = box_sent.get(from_address, (0, 0))
+                box_sent[from_address] = (total + 1,
+                                          cold_sent + (1 if item["kind"] == "sequence" else 0))
             now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
             # A note that the check moved it back no longer applies.
             note = {"error": ""} if (item.get("error") or "").startswith(RECHECK_PREFIX) else {}
             await self.state.update_outbox_item(
                 item["id"], status="sent", sent_at=now_iso, body=body,
                 message_id=result.message_id, thread_ref=result.thread_ref, **note,
+                **({"from_address": from_address} if from_address else {}),
             )
             if prospect.status in ("new", "queued"):
                 await self.state.update_prospect_status(prospect.id, "contacted")
@@ -1082,6 +1174,8 @@ class Sender:
                 "to": item["to_email"], "step": item["step"],
                 "kind": item["kind"], "provider": self.provider.name,
             }
+            if from_address:
+                details["from"] = from_address
             if receipt_id:
                 details["precleared_receipt"] = receipt_id
             await self.state.log_action(
@@ -1123,6 +1217,10 @@ class Sender:
                     f"cold cap is {cold_cap}. Replies still go out. See `harvey warmup`.")
             else:
                 logger.info(f"Sender: cold email cap reached for today ({cold_cap}).")
+        if held_mailbox:
+            logger.info(
+                f"Sender: {held_mailbox} email(s) wait for their mailbox: it is at today's "
+                "limit, switched off or not signed in (Settings > Sending mailboxes).")
         if sent_cold:
             await self.state.remember_footer_lines(compliance_footer_lines(self.config))
             notice = compliance_notice(self.config)

@@ -9,6 +9,17 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Send from several mailboxes.** With Gmail or Google Workspace, add
+  sending mailboxes on the dashboard (Settings > Sending mailboxes): enter the
+  address, the sender's name and a daily limit, and sign in with Google in the
+  same tab. Each person is given one mailbox when their first email is queued,
+  in proportion to the limits, and every follow-up and reply uses it; a reply
+  is answered from the mailbox it arrived in. Each mailbox has its own daily
+  limit and warmup start date. A mailbox that is off, signed out or at its
+  limit holds its email instead of handing it to another sender. The closing
+  name of an email is swapped for the sending mailbox's own sender at queue
+  time, so the Outbox shows what goes out and from where. With no list,
+  Harvey sends from `persona.email` exactly as before.
 - **Find people through SalesQL.** Connect a SalesQL API/MCP key
   (`harvey salesql connect`, or the Discover tab) and Harvey can search for
   people by job title, industry or company-name keywords, company size and

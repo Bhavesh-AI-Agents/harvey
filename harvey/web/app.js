@@ -417,7 +417,7 @@ function loadCurrentTab() {
     case 'conversations': loadConversations(); break;
     case 'activity': loadActivity(); break;
     case 'usage': loadUsage(); break;
-    case 'settings': loadSettings(); loadSendingModeCard(); break;
+    case 'settings': loadSettings(); loadSendingModeCard(); loadMailboxes(); break;
     case 'controls': loadHarveyStatus(); loadLogs(); break;
   }
 }
@@ -967,6 +967,150 @@ async function stopDiscovery() {
 
 // Companies found but not looked at: reading their sites is free and
 // model-free, and it is what makes an email specific.
+// ── Sending mailboxes: add, sign in with Google, limit, switch off ──
+
+async function loadMailboxes() {
+  const el = document.getElementById('mailboxes-card');
+  if (!el) return;
+  const data = await api('/api/mailboxes');
+  if (!data) { el.innerHTML = offlineState(); return; }
+  let html = '';
+  if (data.provider && data.provider !== 'gmail') {
+    html += '<div class="card"><p style="margin:0">Several mailboxes work with Gmail and Google ' +
+      'Workspace. Harvey is set to <b>' + escHtml(data.provider) + '</b>: set ' +
+      '<code>channels.email.provider: gmail</code> in harvey.yaml to send from this list.</p></div>';
+  }
+  const boxes = data.mailboxes || [];
+  if (boxes.length) {
+    html += '<div class="table-card"><table><thead><tr><th>Mailbox</th><th>Sign-in</th>' +
+      '<th>Today</th><th>Daily limit</th><th>Warmup started</th><th>Warmup service</th>' +
+      '<th></th></tr></thead><tbody>' + boxes.map((b, i) => {
+        const tone = !b.enabled ? 't-waiting' : (b.signed_in ? 't-good' : 't-bad');
+        const label = !b.enabled ? 'off' : (b.signed_in ? 'signed in' : 'not signed in');
+        const w = b.warmup;
+        const wTone = !w ? '' : (w.status === 'ok' ? 't-good' : (w.status === 'fail' ? 't-bad' : 't-waiting'));
+        return '<tr><td><b>' + escHtml(b.address) + '</b><br>' +
+          '<input class="form-input" style="margin-top:4px;max-width:200px" id="mb-name-' + i +
+          '" value="' + escHtml(b.name) + '" placeholder="Sender name" aria-label="Sender name"></td>' +
+          '<td><span class="badge ' + tone + '">' + label + '</span>' +
+          (b.signed_in ? '' : '<br><button class="btn btn-secondary btn-sm" style="margin-top:6px" ' +
+            'onclick="signInMailbox(' + jsq(b.address) + ')">Sign in with Google</button>') + '</td>' +
+          '<td>' + b.sent_today + ' sent<br><span class="muted">' + b.cold_sent_today + ' of ' +
+          b.cold_cap_today + ' cold &middot; ' + b.queued + ' queued</span></td>' +
+          '<td><input class="form-input" style="max-width:90px" type="number" min="0" max="' +
+          data.max + '" id="mb-limit-' + i + '" value="' + b.daily_limit + '" aria-label="Daily limit"></td>' +
+          '<td><input class="form-input" style="max-width:160px" type="date" id="mb-start-' + i +
+          '" value="' + escHtml(b.warmup_start || '') + '" aria-label="Warmup started"></td>' +
+          '<td>' + (w ? '<span class="badge ' + wTone + '" title="' + escHtml(w.detail) + '">' +
+            escHtml(w.status) + '</span>' : '<span class="muted">not connected</span>') + '</td>' +
+          '<td style="white-space:nowrap">' +
+          '<button class="btn btn-secondary btn-sm" onclick="saveMailbox(' + jsq(b.address) + ',' + i + ')">Save</button> ' +
+          '<button class="btn btn-secondary btn-sm" onclick="toggleMailbox(' + jsq(b.address) + ',' +
+          (b.enabled ? 'false' : 'true') + ')">' + (b.enabled ? 'Switch off' : 'Switch on') + '</button> ' +
+          '<button class="btn btn-danger btn-sm" onclick="removeMailbox(' + jsq(b.address) + ')">Remove</button>' +
+          '</td></tr>';
+      }).join('') + '</tbody></table></div>';
+  } else {
+    html += '<div class="card"><p style="margin:0">No sending list yet, so Harvey sends from the one ' +
+      'mailbox in <code>persona.email</code>' + (data.persona_email ? ' (' + escHtml(data.persona_email) + ')' : '') +
+      '. Add mailboxes here to send from several.</p></div>';
+  }
+  html += '<div class="card" style="margin-top:16px"><h3>Add a mailbox</h3>' +
+    (data.gmail_ready ? '' : '<p class="desc">First save your Google OAuth client ID and secret ' +
+      'under Gmail below.</p>') +
+    '<p class="desc">Your Google OAuth client must list this redirect address: <code>' +
+    escHtml(data.redirect_uri) + '</code></p>' +
+    '<div class="form-row">' +
+    '<div class="form-group" style="flex:2"><label class="form-label" for="mb-new-address">Email address</label>' +
+    '<input class="form-input" id="mb-new-address" type="email" autocomplete="off" placeholder="name@yourdomain.com"></div>' +
+    '<div class="form-group" style="flex:2"><label class="form-label" for="mb-new-name">Sender name</label>' +
+    '<input class="form-input" id="mb-new-name" autocomplete="off" placeholder="The real person who sends from it"></div>' +
+    '<div class="form-group"><label class="form-label" for="mb-new-limit">Daily limit</label>' +
+    '<input class="form-input" id="mb-new-limit" type="number" min="0" max="' + data.max + '" value="50"></div>' +
+    '</div><div class="btn-group"><button class="btn btn-primary" onclick="addMailbox()"' +
+    (data.gmail_ready ? '' : ' disabled') + '>Add and sign in with Google</button></div>' +
+    '<p class="desc" style="margin-top:10px">A new mailbox starts its warmup today: no cold email for the ' +
+    'first days, then a slow ramp up to its limit. Change the start date in the list if it has ' +
+    'been warming longer, or clear it to use the full limit at once.</p></div>';
+  el.innerHTML = html;
+}
+
+function goToGoogle(data, failure) {
+  if (data && data.success && typeof data.auth_url === 'string' &&
+      data.auth_url.startsWith('https://accounts.google.com/')) {
+    window.location.assign(data.auth_url);   // same tab: this tab holds the dashboard token
+    return;
+  }
+  showToast((data && data.message) || failure, 'error');
+  loadMailboxes();
+}
+
+async function addMailbox() {
+  const v = id => (document.getElementById(id) || {}).value || '';
+  const data = await api('/api/mailboxes', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({address: v('mb-new-address'), name: v('mb-new-name'),
+                          daily_limit: parseInt(v('mb-new-limit'), 10)}),
+  });
+  goToGoogle(data, 'Could not add the mailbox.');
+}
+
+async function signInMailbox(address) {
+  const data = await api('/api/mailboxes/sign-in', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({address: address}),
+  });
+  goToGoogle(data, 'Could not start the sign-in.');
+}
+
+async function updateMailbox(body, done) {
+  const data = await api('/api/mailboxes/update', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+  });
+  showToast(data && data.success ? done : (data && data.message) || 'Could not save.',
+            data && data.success ? 'success' : 'error');
+  loadMailboxes();
+}
+
+function saveMailbox(address, i) {
+  const v = id => (document.getElementById(id) || {}).value || '';
+  updateMailbox({address: address, name: v('mb-name-' + i),
+                 daily_limit: parseInt(v('mb-limit-' + i), 10),
+                 warmup_start: v('mb-start-' + i)}, 'Saved.');
+}
+
+function toggleMailbox(address, on) {
+  updateMailbox({address: address, enabled: on}, on ? 'Switched on.' : 'Switched off.');
+}
+
+async function removeMailbox(address) {
+  const data = await api('/api/mailboxes/remove', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({address: address}),
+  });
+  showToast(data && data.success ? 'Removed.' : (data && data.message) || 'Could not remove it.',
+            data && data.success ? 'success' : 'error');
+  loadMailboxes();
+}
+
+// Back from Google: the address carries ?code=...&state=... once. Take them
+// out of the address bar straight away, then hand them to Harvey.
+(async function finishMailboxSignIn() {
+  const params = new URLSearchParams(window.location.search);
+  const code = params.get('code'), state = params.get('state'), error = params.get('error');
+  if (!state || (!code && !error)) return;
+  history.replaceState(null, '', window.location.pathname);
+  if (error) { showToast('Google sign-in was cancelled.', 'error'); return; }
+  const data = await api('/api/mailboxes/finish', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({code: code, state: state}),
+  });
+  showToast((data && data.message) || 'The sign-in could not be completed.',
+            data && data.success ? 'success' : 'error');
+  const btn = document.querySelector('nav button[onclick*="\'settings\'"]');
+  if (btn) showTab('settings', btn);
+})();
+
 // ── SalesQL: search is free, a reveal spends one credit per person ──
 let _salesqlBusy = false;
 
@@ -2008,6 +2152,7 @@ function renderDesk(items, i) {
     '<div class="desk-list">' + rail + '</div>' +
     '<div class="desk-pane">' +
       '<div class="to-line">To <b>' + escHtml(cur.to_email) + '</b>' +
+      (cur.from_address ? ' &middot; from <b>' + escHtml(cur.from_address) + '</b>' : '') +
         '<span class="tag">' + (cur.kind === 'reply' ? 'Reply' : 'Email ' + escHtml(String(cur.step))) + '</span>' +
         '<span class="muted">sends ' + formatDate(cur.send_at) + '</span></div>' +
       renderDeskContext(cur.context) +
