@@ -982,6 +982,61 @@ async def salesql_audience_save(request: Request):
     return {"success": True, "audiences": shown, "notes": notes}
 
 
+_describe_lock = asyncio.Lock()
+
+
+@app.post("/api/salesql/describe")
+async def salesql_describe(request: Request):
+    """Turn a plain description of who to find into an audience, with
+    Harvey's own model. Nothing is saved: the form shows it for review."""
+    from harvey.collectors import salesql as collector
+    data = await _json_body(request)
+    text = data.get("text")
+    if not isinstance(text, str) or len(text) > 4000:
+        return _refuse("Describe who you want to find in a sentence or two.", 400)
+    if _describe_lock.locked():
+        return _refuse("The model is still working on the last description.", 409)
+    async with _describe_lock:
+        state = _state()
+        await state.init_db()
+        try:
+            from harvey.brain import Brain, BrainUnavailable
+            from harvey.config import load_config
+            config = load_config()
+            brain = Brain(state, config.brain)
+
+            async def think(prompt: str):
+                answer = await brain.think(
+                    prompt + "\n\nRespond ONLY with valid JSON. No markdown, no explanation.",
+                    expect_json=True, timeout=120, max_retries=1,
+                    agent="scout", task="salesql_audience")
+                if not answer:
+                    why = ""
+                    try:
+                        why = brain.paused_reason() or ""
+                    except Exception:
+                        pass
+                    raise ValueError(
+                        "Harvey's model didn't answer" + (f" ({why})" if why else "") + ". On the "
+                        "machine Harvey runs on, 'harvey status --check' says what is wrong. "
+                        "You can still set the filters by hand.")
+                return brain._extract_json(answer)
+
+            shown = await collector.list_audiences(state, config)
+            result = await collector.audience_from_text(
+                state, think, text, page_size=shown["audience"].get("page_size", 100))
+        except ValueError as e:
+            return _refuse(str(e), 400)
+        except BrainUnavailable as e:
+            return _refuse(f"Harvey's model can't be used right now: {e}", 409)
+        except Exception as e:
+            logger.warning("Describing an audience failed: %s", type(e).__name__)
+            return _refuse("Harvey's model didn't answer. On the machine Harvey runs on, "
+                           "'harvey status --check' says what is wrong.", 409)
+    await state.log_action("salesql_describe", "dashboard", {"chars": len(text)})
+    return {"success": True, **result}
+
+
 @app.post("/api/salesql/audience/select")
 async def salesql_audience_select(request: Request):
     from harvey.collectors import salesql as collector

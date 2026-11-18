@@ -20,6 +20,7 @@ const SQ = {
   offered: {},       // field -> names SalesQL offered for typed text
   busy: '',          // 'search' | 'reveal' | 'save' | ''
   notes: [],
+  describe: '', describeNote: '',
   timer: null, catalogTimer: null,
 };
 
@@ -141,7 +142,7 @@ function sqConnectCard(data) {
 function sqRender() {
   const root = sqEl('salesql-root');
   if (!root || !SQ.data) return;
-  root.innerHTML = sqAccountBar() +
+  root.innerHTML = sqAccountBar() + sqDescribeCard() +
     '<div class="sq-grid"><aside class="sq-panel" id="sq-panel">' + sqPanel() + '</aside>' +
     '<section class="sq-results" id="sq-results">' + sqResults() + '</section></div>';
 }
@@ -159,6 +160,51 @@ function sqAccountBar() {
     '<div class="sq-stat sq-cap"><label class="sq-stat-label" for="sq-cap">Daily reveal cap</label>' +
     '<span><input class="form-input" id="sq-cap" type="number" min="0" max="1000" value="' + d.cap + '">' +
     '<button class="btn btn-secondary btn-sm" onclick="sqSaveCap()">Save</button></span></div></div>';
+}
+
+// ── Describe it in words ──
+
+function sqDescribeCard() {
+  return '<div class="card sq-describe"><label class="sq-panel-title" for="sq-describe">Describe who you want to find</label>' +
+    '<p class="desc">Write it in your own words and Harvey\'s model fills in the filters below. ' +
+    'Nothing is saved or searched until you have looked them over.</p>' +
+    '<textarea class="form-input" id="sq-describe" rows="3" maxlength="1500" placeholder="' +
+    'Owners and founders of small non-software businesses in California, 1 to 10 employees, with no developers on staff. Not agencies or consultants.' +
+    '" oninput="SQ.describe = this.value">' + escHtml(SQ.describe || '') + '</textarea>' +
+    '<div class="sq-row" style="margin-top:10px"><button class="btn btn-primary" id="sq-describe-btn" onclick="sqDescribe()"' +
+    (SQ.busy ? ' disabled' : '') + '>' + (SQ.busy === 'describe' ? 'Working it out…' : 'Set the filters') + '</button>' +
+    '<span class="muted" id="sq-describe-note">' + escHtml(SQ.describeNote || '') + '</span></div></div>';
+}
+
+async function sqDescribe() {
+  const text = (SQ.describe || '').trim();
+  if (SQ.busy) return;
+  if (text.length < 8) { showToast('Describe who you want to find in a sentence or two.', 'error'); return; }
+  if (SQ.dirty && !confirm('Replace the filters you have changed but not saved?')) return;
+  SQ.busy = 'describe';
+  SQ.describeNote = 'This can take up to a minute.';
+  sqRender();
+  const data = await sqPost('/api/salesql/describe', {text: text});
+  SQ.busy = '';
+  SQ.describeNote = '';
+  if (!data || !data.success) {
+    showToast((data && data.message) || 'Could not set the filters.', 'error');
+    sqRender();
+    return;
+  }
+  SQ.aud = data.audience;
+  SQ.dirty = true;
+  SQ.notes = data.notes || [];
+  // Open every part the description filled in, so it can be checked at a glance.
+  SQ.open = new Set(SQ_FIELDS.filter(f => data.audience[f.key].include.length || data.audience[f.key].exclude.length)
+    .map(f => f.key));
+  if (data.audience.company_sizes.length) SQ.open.add('sizes');
+  if (data.audience.staff.length) SQ.open.add('staff');
+  if (SQ_FLAGS.some(([k]) => data.audience[k]) ||
+      SQ_RANGES.some(([k]) => data.audience[k].min !== null || data.audience[k].max !== null)) SQ.open.add('more');
+  SQ.describeNote = 'Filters set from your description. Check them, then press Save and search.';
+  sqRender();
+  showToast('Filters set. Check them, then press Save and search.', 'success');
 }
 
 // ── Audience panel ──
@@ -180,7 +226,7 @@ function sqPanel() {
     '<input class="form-input" id="sq-name" type="text" maxlength="60" value="' + escHtml(SQ.aud.name) +
     '" oninput="sqSet(\'name\', this.value)"></div>';
   if (SQ.notes.length) {
-    html += '<div class="banner wait sq-notes"><div><p><b>Names SalesQL doesn\'t know. Remove them or pick from its list:</b></p>' +
+    html += '<div class="banner wait sq-notes"><div><p><b>Worth a look:</b></p>' +
       SQ.notes.map(n => '<p>' + escHtml(n) + '</p>').join('') + '</div></div>';
   }
 

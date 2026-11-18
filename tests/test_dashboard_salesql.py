@@ -188,3 +188,30 @@ def test_people_can_be_taken_off_the_list_for_free(client, env):
     r = client.post("/api/salesql/dismiss", json={"ids": ["p-1", "p-missing"]}).json()
     assert r["dismissed"] == 1 and client.get("/api/salesql").json()["candidates"] == []
     assert client.post("/api/salesql/dismiss", json={"ids": []}).status_code == 400
+
+
+def test_describing_an_audience_asks_the_model_and_saves_nothing(client, monkeypatch):
+    from harvey import brain as brain_module
+    calls = []
+
+    async def fake_think(self, prompt, **kw):
+        calls.append(kw)
+        return '{"name": "Shop owners", "job_titles": {"include": ["Owner"]}, "company_sizes": ["1-10"]}'
+    monkeypatch.setattr(brain_module.Brain, "think", fake_think)
+    r = client.post("/api/salesql/describe", json={"text": "Owners of small shops"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["audience"]["name"] == "Shop owners" and body["audience"]["company_sizes"] == ["1-10"]
+    assert calls and calls[0]["task"] == "salesql_audience" and calls[0]["max_retries"] == 1
+    assert client.get("/api/salesql").json()["audiences"]["saved"] is False
+
+
+def test_a_model_that_does_not_answer_says_what_to_do(client, monkeypatch):
+    from harvey import brain as brain_module
+
+    async def silent(self, prompt, **kw):
+        return ""
+    monkeypatch.setattr(brain_module.Brain, "think", silent)
+    r = client.post("/api/salesql/describe", json={"text": "Owners of small shops"})
+    assert r.status_code == 400 and "harvey status --check" in r.json()["message"]
+    assert client.post("/api/salesql/describe", json={"text": 5}).status_code == 400
