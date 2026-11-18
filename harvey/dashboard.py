@@ -797,13 +797,7 @@ async def salesql_overview():
         config = load_config()
         out["cap"] = await collector.daily_cap(state, config)
         out["left_today"] = await collector.reveals_left_today(state, config)
-        out["search"] = await collector.search_settings(state, config)
-        out["rules"] = [{**r, "text": collector.describe_rule(r)}
-                        for r in await collector.get_rules(state, config)]
-        out["rule_options"] = {
-            "where": collector.WHERE,
-            "filters": {k: {"label": v, "takes": collector.FILTERS[k][1]}
-                        for k, v in collector.FILTER_LABELS.items()}}
+        out["audiences"] = await collector.list_audiences(state, config)
         out["sizes"] = [r[0] for r in collector.SIZE_RANGES]
     except Exception:
         config = None
@@ -921,26 +915,6 @@ async def salesql_catalog():
             "note": "" if running or complete else _catalog_note}
 
 
-@app.post("/api/salesql/rules")
-async def salesql_rules(request: Request):
-    """Save the rules that decide who is a good prospect."""
-    from harvey.collectors import salesql as collector
-    try:
-        data = await request.json()
-    except Exception:
-        data = None
-    state = _state()
-    await state.init_db()
-    try:
-        rules = await collector.set_rules(state, data.get("rules") if isinstance(data, dict)
-                                          else None)
-    except ValueError as e:
-        return JSONResponse({"success": False, "message": str(e)}, status_code=400)
-    await state.log_action("salesql_rules", "dashboard", {"rules": len(rules)})
-    return {"success": True,
-            "rules": [{**r, "text": collector.describe_rule(r)} for r in rules]}
-
-
 @app.post("/api/salesql/lookup")
 async def salesql_lookup(request: Request):
     """The names SalesQL has for what was typed: countries, states or industries. Free."""
@@ -969,36 +943,91 @@ async def salesql_lookup(request: Request):
     return {"success": True, "values": names}
 
 
-@app.post("/api/salesql/settings")
-async def salesql_settings(request: Request):
-    """Save who a search looks for: titles, size, place, industries."""
-    from harvey.collectors import salesql as collector
+async def _json_body(request: Request):
     try:
         data = await request.json()
     except Exception:
         data = None
+    return data if isinstance(data, dict) else {}
+
+
+@app.post("/api/salesql/audience")
+async def salesql_audience_save(request: Request):
+    """Save an audience (who to look for) and make it the one searches use.
+    {"id": "..."} updates that one; without an id a new one is made."""
+    from harvey.collectors import salesql as collector
+    data = await _json_body(request)
     state = _state()
     await state.init_db()
+    audience_id = data.get("id") if isinstance(data.get("id"), str) else ""
     try:
-        from harvey.config import load_config
-        saved = await collector.set_search_settings(state, load_config(), data)
+        audience_id = await collector.save_audience(state, data.get("audience"), audience_id)
     except ValueError as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=400)
+    await state.log_action("salesql_audience", "dashboard", {"saved": audience_id})
+    notes: list[str] = []
+    key = _salesql_key()
+    try:
+        from harvey.config import load_config
+        shown = await collector.list_audiences(state, load_config())
+        if key:
+            from harvey.integrations import salesql as sq
+            try:
+                notes = await collector.check_names(state, shown["audience"], key)
+            except sq.SalesQLError as e:
+                notes = [f"Couldn't check the names with SalesQL: {e}"]
     except Exception:
         return JSONResponse({"success": False, "message": "harvey.yaml couldn't be read."},
                             status_code=400)
-    await state.log_action("salesql_settings", "dashboard",
-                           {k: len(v) if isinstance(v, list) else v for k, v in saved.items()})
-    # Say now, not at the next search, which names SalesQL doesn't know.
-    notes: list[str] = []
-    key = _salesql_key()
-    if key:
-        from harvey.integrations import salesql as sq
-        try:
-            notes = await collector.check_names(state, load_config(), key)
-        except sq.SalesQLError as e:
-            notes = [f"Couldn't check the names with SalesQL: {e}"]
-    return {"success": True, "search": saved, "notes": notes}
+    return {"success": True, "audiences": shown, "notes": notes}
+
+
+@app.post("/api/salesql/audience/select")
+async def salesql_audience_select(request: Request):
+    from harvey.collectors import salesql as collector
+    data = await _json_body(request)
+    state = _state()
+    await state.init_db()
+    try:
+        await collector.select_audience(state, data.get("id") if isinstance(data.get("id"), str)
+                                        else "")
+    except ValueError as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=400)
+    return {"success": True}
+
+
+@app.post("/api/salesql/audience/delete")
+async def salesql_audience_delete(request: Request):
+    from harvey.collectors import salesql as collector
+    data = await _json_body(request)
+    state = _state()
+    await state.init_db()
+    try:
+        await collector.delete_audience(state, data.get("id") if isinstance(data.get("id"), str)
+                                        else "")
+    except ValueError as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=400)
+    await state.log_action("salesql_audience", "dashboard", {"deleted": data.get("id")})
+    return {"success": True}
+
+
+@app.post("/api/salesql/dismiss")
+async def salesql_dismiss(request: Request):
+    """Take people off the list without revealing them. Spends nothing."""
+    data = await _json_body(request)
+    ids = data.get("ids")
+    if not isinstance(ids, list) or not ids or len(ids) > 500 \
+            or not all(isinstance(i, str) and 0 < len(i) <= 64 for i in ids):
+        return JSONResponse({"success": False, "message": "Tick at least one person."},
+                            status_code=400)
+    state = _state()
+    await state.init_db()
+    rows = [r for r in await state.get_salesql_candidates(ids=list(dict.fromkeys(ids)))
+            if r["status"] == "found"]
+    for r in rows:
+        await state.update_salesql_candidate(r["id"], status="dismissed",
+                                             note="Taken off the list by you.")
+    return {"success": True, "dismissed": len(rows)}
 
 
 @app.post("/api/salesql/search")

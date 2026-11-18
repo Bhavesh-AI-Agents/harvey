@@ -187,6 +187,13 @@ FILTERS = {
     "exclude_past_titles": ("past_job_titles", "exclude"),
     "past_titles": ("past_job_titles", "include"),
 }
+# list name -> (SalesQL lookup type, the search fields it narrows, word for messages)
+LOOKUP_FIELDS = {
+    "countries": ("country", ("organization_countries", "countries"), "country"),
+    "states": ("region", ("organization_states_or_cities", "states_or_cities"), "state"),
+    "industries": ("industry", ("organization_industries",), "industry"),
+    "company_types": ("company_type", ("organization_company_types",), "company type"),
+}
 FILTER_LABELS = {
     "has_phone": "Has a phone number", "has_work_phone": "Has a work phone number",
     "has_verified_email": "Has an email SalesQL verified",
@@ -251,6 +258,11 @@ def clean_rules(data) -> list[dict]:
             else:
                 value = _words(value, f"Rule {n}, job titles")
             rule.update(filter=name, value=value)
+        elif kind == "lookup":
+            if raw.get("field") not in LOOKUP_FIELDS or raw.get("mode") not in ("include", "exclude"):
+                raise ValueError(f"Rule {n}: unknown list or mode.")
+            rule.update(field=raw["field"], mode=raw["mode"],
+                        names=_words(raw.get("names"), f"Rule {n}, names"))
         else:
             raise ValueError(f"Rule {n}: unknown kind of rule.")
         out.append(rule)
@@ -299,6 +311,9 @@ def describe_rule(rule: dict) -> str:
         who = "nobody" if rule["mode"] == "none" else "at least one person"
         return (f"The company must have {who} with a {rule['label']} job title "
                 f"({', '.join(rule['titles'])}).")
+    if rule["kind"] == "lookup":
+        verb = "Only" if rule["mode"] == "include" else "Leave out"
+        return f"{verb} these {LOOKUP_FIELDS[rule['field']][2]} values: {', '.join(rule['names'])}."
     label = FILTER_LABELS[rule["filter"]]
     value = rule["value"]
     if value is True:
@@ -379,6 +394,268 @@ def grade_by_rules(person: dict, rules: list[dict], *, allowed_sizes,
 
 def _l(x) -> list:
     return x if isinstance(x, list) else []
+
+
+# ── audiences: a saved answer to "who am I looking for?" ──
+#
+# An audience is what the dashboard edits. Every list in it has an include
+# side and an exclude side. It is turned into the search settings and rules
+# above, so there is one engine and the audience is only its front.
+
+AUDIENCES_KEY = "salesql:audiences"
+MAX_AUDIENCES = 30
+PAIR_FIELDS = ("job_titles", "past_titles", "profile_words", "countries", "states", "cities",
+               "industries", "company_types", "company_keywords")
+RANGE_FIELDS = {"experience": ("experience_min", "experience_max"),
+                "in_role": ("in_role_min", "in_role_max"),
+                "founded": ("founded_from", "founded_to")}
+FLAG_FIELDS = ("has_phone", "has_work_phone", "has_verified_email")
+
+
+def _pair(raw, what: str) -> dict:
+    raw = raw if isinstance(raw, dict) else {}
+    out = {}
+    for side in ("include", "exclude"):
+        values = raw.get(side, [])
+        if not isinstance(values, list) or len(values) > 60 \
+                or not all(isinstance(v, str) and len(v) <= 80 for v in values):
+            raise ValueError(f"{what}: up to 60 entries of at most 80 characters each.")
+        out[side] = list(dict.fromkeys(re.sub(r"\s+", " ", v).strip() for v in values if v.strip()))
+    both = {v.lower() for v in out["include"]} & {v.lower() for v in out["exclude"]}
+    if both:
+        raise ValueError(f"{what}: \"{sorted(both)[0]}\" is both included and excluded.")
+    return out
+
+
+def clean_audience(data) -> dict:
+    """An audience, checked. Raises ValueError a person can act on."""
+    if not isinstance(data, dict):
+        raise ValueError("Send the audience as JSON.")
+    name = re.sub(r"\s+", " ", _s(data.get("name")))[:60] or "My audience"
+    out: dict = {"name": name}
+    for field in PAIR_FIELDS:
+        out[field] = _pair(data.get(field), field.replace("_", " ").capitalize())
+    if not out["job_titles"]["include"]:
+        raise ValueError("Give at least one job title to look for.")
+    known = [r[0] for r in SIZE_RANGES]
+    sizes = data.get("company_sizes", [])
+    if not isinstance(sizes, list) or any(v not in known for v in sizes):
+        raise ValueError("Company sizes must be from: " + ", ".join(known) + ".")
+    out["company_sizes"] = [v for v in known if v in sizes]
+    staff = data.get("staff", [])
+    if not isinstance(staff, list) or len(staff) > 10:
+        raise ValueError("Up to 10 staff checks.")
+    out["staff"] = []
+    for n, raw in enumerate(staff, start=1):
+        if not isinstance(raw, dict) or raw.get("must") not in ("none", "some"):
+            raise ValueError(f"Staff check {n}: choose 'nobody' or 'at least one'.")
+        out["staff"].append({
+            "label": re.sub(r"\s+", " ", _s(raw.get("label")))[:30] or "these",
+            "must": raw["must"], "titles": _words(raw.get("titles"), f"Staff check {n}, titles")})
+    for field in FLAG_FIELDS:
+        out[field] = data.get(field) is True
+    for field in RANGE_FIELDS:
+        raw = data.get(field) if isinstance(data.get(field), dict) else {}
+        pair = {}
+        for side in ("min", "max"):
+            value = raw.get(side)
+            if value in (None, ""):
+                pair[side] = None
+                continue
+            if isinstance(value, str) and value.strip().isdigit():
+                value = int(value.strip())
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 2100:
+                raise ValueError(f"{field.replace('_', ' ').capitalize()}: give whole numbers.")
+            pair[side] = value
+        if pair["min"] is not None and pair["max"] is not None and pair["min"] > pair["max"]:
+            raise ValueError(f"{field.replace('_', ' ').capitalize()}: the lower number "
+                             "is above the higher one.")
+        out[field] = pair
+    size = data.get("page_size", 100)
+    if isinstance(size, bool) or not isinstance(size, int) or not 20 <= size <= 100:
+        raise ValueError("People per search must be a whole number from 20 to 100.")
+    out["page_size"] = size
+    return out
+
+
+def audience_to_engine(aud: dict) -> tuple[dict, list[dict]]:
+    """An audience as (search settings, rules) for the engine above."""
+    settings = {
+        "job_titles": aud["job_titles"]["include"], "company_sizes": aud["company_sizes"],
+        "countries": aud["countries"]["include"], "states": aud["states"]["include"],
+        "cities": aud["cities"]["include"], "industries": aud["industries"]["include"],
+        "company_keywords": aud["company_keywords"]["include"], "page_size": aud["page_size"],
+        "require_no_developers": False, "technical_words": [],
+    }
+    rules: list[dict] = []
+
+    def add(rule_id, **rule):
+        rules.append({"id": rule_id, **rule})
+
+    if aud["job_titles"]["exclude"]:
+        add("x-titles", kind="filter", filter="exclude_titles", value=aud["job_titles"]["exclude"])
+    if aud["past_titles"]["include"]:
+        add("past", kind="filter", filter="past_titles", value=aud["past_titles"]["include"])
+    if aud["past_titles"]["exclude"]:
+        add("x-past", kind="filter", filter="exclude_past_titles",
+            value=aud["past_titles"]["exclude"])
+    if aud["profile_words"]["include"]:
+        add("words", kind="person_words", where="title_or_headline", mode="has_any",
+            words=aud["profile_words"]["include"])
+    if aud["profile_words"]["exclude"]:
+        add("x-words", kind="person_words", where="title_or_headline", mode="has_none",
+            words=aud["profile_words"]["exclude"])
+    if aud["cities"]["exclude"]:
+        add("x-cities", kind="person_words", where="location", mode="has_none",
+            words=aud["cities"]["exclude"])
+    if aud["company_keywords"]["exclude"]:
+        add("x-company", kind="person_words", where="company_name", mode="has_none",
+            words=aud["company_keywords"]["exclude"])
+    for field in ("countries", "states", "industries"):
+        if aud[field]["exclude"]:
+            add("x-" + field, kind="lookup", field=field, mode="exclude",
+                names=aud[field]["exclude"])
+    for side in ("include", "exclude"):
+        if aud["company_types"][side]:
+            add(("" if side == "include" else "x-") + "types", kind="lookup",
+                field="company_types", mode=side, names=aud["company_types"][side])
+    for n, check in enumerate(aud["staff"], start=1):
+        add(f"staff-{n}", kind="company_staff", mode=check["must"], label=check["label"],
+            titles=check["titles"])
+    for field in FLAG_FIELDS:
+        if aud[field]:
+            add(field, kind="filter", filter=field, value=True)
+    for field, (low, high) in RANGE_FIELDS.items():
+        if aud[field]["min"] is not None:
+            add(low, kind="filter", filter=low, value=aud[field]["min"])
+        if aud[field]["max"] is not None:
+            add(high, kind="filter", filter=high, value=aud[field]["max"])
+    return settings, clean_rules(rules)
+
+
+async def audience_from_legacy(state, config) -> dict:
+    """The audience that the settings and rules in force describe: the
+    starting point shown before any audience has been saved."""
+    values = await search_settings(state, config)
+    aud: dict = {"name": "My audience", "company_sizes": values["company_sizes"],
+                 "page_size": values["page_size"], "staff": []}
+    for field in PAIR_FIELDS:
+        aud[field] = {"include": list(values.get(field, [])), "exclude": []}
+    for field in FLAG_FIELDS:
+        aud[field] = False
+    for field in RANGE_FIELDS:
+        aud[field] = {"min": None, "max": None}
+    sides = {v: (field, side) for field, pair in RANGE_FIELDS.items()
+             for side, v in zip(("min", "max"), pair)}
+    for rule in await get_rules(state, config):
+        if rule["kind"] == "company_staff":
+            aud["staff"].append({"label": rule["label"], "must": rule["mode"],
+                                 "titles": rule["titles"]})
+        elif rule["kind"] == "person_words":
+            target = {"title_or_headline": "profile_words", "title": "profile_words",
+                      "headline": "profile_words", "location": "cities",
+                      "company_name": "company_keywords"}.get(rule["where"])
+            if target:
+                side = "include" if rule["mode"] == "has_any" else "exclude"
+                aud[target][side] = list(dict.fromkeys(aud[target][side] + rule["words"]))
+        elif rule["kind"] == "lookup":
+            aud[rule["field"]][rule["mode"]] = list(dict.fromkeys(
+                aud[rule["field"]][rule["mode"]] + rule["names"]))
+        elif rule["filter"] in FLAG_FIELDS:
+            aud[rule["filter"]] = True
+        elif rule["filter"] in sides:
+            field, side = sides[rule["filter"]]
+            aud[field][side] = rule["value"]
+        else:
+            field, side = {"exclude_titles": ("job_titles", "exclude"),
+                           "exclude_past_titles": ("past_titles", "exclude"),
+                           "past_titles": ("past_titles", "include")}[rule["filter"]]
+            aud[field][side] = list(dict.fromkeys(aud[field][side] + rule["value"]))
+    for field in PAIR_FIELDS:            # the file may name the same word on both sides
+        drop = {v.lower() for v in aud[field]["exclude"]}
+        aud[field]["include"] = [v for v in aud[field]["include"] if v.lower() not in drop]
+    return aud
+
+
+async def _audiences(state) -> dict:
+    try:
+        data = json.loads(await state.get_setting(AUDIENCES_KEY, "") or "{}")
+    except ValueError:
+        data = {}
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, dict):
+        return {"active": "", "items": {}}
+    good = {}
+    for key, raw in items.items():
+        try:
+            good[str(key)[:40]] = clean_audience(raw)
+        except ValueError:
+            continue
+    active = data.get("active") if data.get("active") in good else next(iter(good), "")
+    return {"active": active, "items": good}
+
+
+async def list_audiences(state, config) -> dict:
+    """{"active": id, "items": [{id, name}], "audience": the active one,
+    "saved": whether any audience has been saved}."""
+    data = await _audiences(state)
+    if not data["items"]:
+        return {"active": "", "items": [], "saved": False,
+                "audience": await audience_from_legacy(state, config)}
+    return {"active": data["active"], "saved": True,
+            "items": [{"id": k, "name": v["name"]} for k, v in data["items"].items()],
+            "audience": data["items"][data["active"]]}
+
+
+async def save_audience(state, audience, audience_id: str = "") -> str:
+    """Save an audience (a new one when ``audience_id`` is empty or unknown)
+    and make it the one searches use. Returns its id."""
+    clean = clean_audience(audience)
+    data = await _audiences(state)
+    if audience_id not in data["items"]:
+        if len(data["items"]) >= MAX_AUDIENCES:
+            raise ValueError(f"Harvey keeps at most {MAX_AUDIENCES} audiences. Delete one first.")
+        audience_id = f"a-{uuid.uuid4().hex[:10]}"
+    taken = {v["name"].lower() for k, v in data["items"].items() if k != audience_id}
+    if clean["name"].lower() in taken:
+        raise ValueError(f"Another audience is already called \"{clean['name']}\".")
+    data["items"][audience_id] = clean
+    data["active"] = audience_id
+    await state.set_setting(AUDIENCES_KEY, json.dumps(data))
+    return audience_id
+
+
+async def select_audience(state, audience_id: str) -> None:
+    data = await _audiences(state)
+    if audience_id not in data["items"]:
+        raise ValueError("That audience no longer exists.")
+    data["active"] = audience_id
+    await state.set_setting(AUDIENCES_KEY, json.dumps(data))
+
+
+async def delete_audience(state, audience_id: str) -> None:
+    data = await _audiences(state)
+    if audience_id not in data["items"]:
+        raise ValueError("That audience no longer exists.")
+    del data["items"][audience_id]
+    if data["active"] == audience_id:
+        data["active"] = next(iter(data["items"]), "")
+    await state.set_setting(AUDIENCES_KEY, json.dumps(data))
+
+
+async def _engine_inputs(state, config):
+    """(config, rules) a search runs on: the active audience when one has
+    been saved, else the settings and rules from harvey.yaml."""
+    data = await _audiences(state)
+    if data["items"]:
+        settings, rules = audience_to_engine(data["items"][data["active"]])
+        # An audience says everything itself: nothing is filled in from the ICP.
+        return (config.model_copy(update={
+            "salesql": config.salesql.model_copy(update=settings),
+            "icp": config.icp.model_copy(update={"industries": [], "geography": [],
+                                                 "titles": [], "company_size": ""})}), rules)
+    config = await _with_search_settings(state, config)
+    return config, await get_rules(state, config)
 
 
 async def build_filters(client, state, config, rules: list[dict] | None = None
@@ -467,6 +744,29 @@ async def build_filters(client, state, config, rules: list[dict] | None = None
                 "SalesQL has none of these industries: " + ", ".join(cfg.industries) + ". "
                 "It uses LinkedIn's industry names (Financial Services, Retail, Real Estate). "
                 "Fix the names, or leave Industries empty to search every industry.")
+    for rule in rules:
+        if rule["kind"] != "lookup":
+            continue
+        kind, fields, word = LOOKUP_FIELDS[rule["field"]]
+        values = []
+        for name in rule["names"]:
+            if kind == "country":
+                name = COUNTRY_ALIASES.get(name.lower(), name)
+            value = await _lookup(client, state, kind, name)
+            if value and value not in values:
+                values.append(value)
+            elif not value:
+                notes.append(f"SalesQL has no {word} called \"{name}\".")
+        if not values:
+            if rule["mode"] == "include":
+                raise sq.SalesQLError(f"SalesQL knows none of the {word} values you chose "
+                                      f"({', '.join(rule['names'])}). Pick them from the list.")
+            continue
+        for field in fields:
+            current = filters.get(field)
+            current = {"include": current} if isinstance(current, list) else dict(_d(current))
+            current[rule["mode"]] = list(dict.fromkeys(_l(current.get(rule["mode"])) + values))
+            filters[field] = current
     return filters, notes
 
 
@@ -504,10 +804,9 @@ async def count_developers(client, org_uuids: list[str], developer_titles) -> di
 
 async def search(state, config, api_key: str, *, transport=None) -> dict:
     """Run one search, grade the results and store them. Spends no credits."""
-    config = await _with_search_settings(state, config)
+    config, rules = await _engine_inputs(state, config)
     cfg = config.salesql
     async with sq.SalesQL(api_key, transport=transport) as client:
-        rules = await get_rules(state, config)
         filters, notes = await build_filters(client, state, config, rules)
         # Each search with the same settings reads the next page, so pressing
         # Search again brings new people, not the same ones.
@@ -661,7 +960,8 @@ async def set_search_settings(state, config, data) -> dict:
 # minute and per day, so collecting is paced, stops well short of the day's
 # allowance, and picks up where it left off.
 
-CATALOG_KINDS = ("industry", "region", "country")
+CATALOG_KINDS = ("company_type", "industry", "region", "country")
+WHOLE = "*"                    # company types come back whole, with no query
 LETTERS = "abcdefghijklmnopqrstuvwxyz"
 LOOKUP_PAGE = 100
 CATALOG_DAY_SHARE = 0.6        # of the day's lookups; the rest is for searches
@@ -678,7 +978,7 @@ async def _catalog_state(state, kind: str) -> dict:
         data = {}
     if not isinstance(data, dict) or not isinstance(data.get("values"), dict) \
             or not isinstance(data.get("pending"), list):
-        data = {"values": {}, "pending": list(LETTERS)}
+        data = {"values": {}, "pending": [WHOLE] if kind == "company_type" else list(LETTERS)}
     return data
 
 
@@ -722,7 +1022,8 @@ async def collect_catalogs(state, api_key: str, *, transport=None, sleep=asyncio
                 prefix = next(x for x in data["pending"] if len(x) == length)
                 await state.increment_setting(_lookups_today_key(), 1)
                 try:
-                    found = await client.lookup(kind, q=prefix, size=LOOKUP_PAGE)
+                    found = await client.lookup(kind, q="" if prefix == WHOLE else prefix,
+                                                size=LOOKUP_PAGE)
                 except sq.SalesQLError as e:
                     out["stopped"] = str(e)
                     return out
@@ -733,7 +1034,7 @@ async def collect_catalogs(state, api_key: str, *, transport=None, sleep=asyncio
                         await state.set_setting(
                             f"salesql:lookup:{kind}:{v['label'].lower()}", v["value"])
                 data["pending"].remove(prefix)
-                if len(found) >= LOOKUP_PAGE and len(prefix) < 3:
+                if len(found) >= LOOKUP_PAGE and len(prefix) < 3 and prefix != WHOLE:
                     # A full page means there are more: ask for each longer start.
                     data["pending"] += [prefix + c for c in LETTERS]
                 await state.set_setting(_catalog_key(kind), json.dumps(data))
@@ -763,32 +1064,33 @@ async def suggest(state, api_key: str, kind: str, q: str, *, transport=None) -> 
     return names
 
 
-async def check_names(state, config, api_key: str, *, transport=None) -> list[str]:
-    """What SalesQL makes of the saved states, countries and industries: one
-    line per name it doesn't know or reads as something else. Free."""
-    values = await search_settings(state, config)
+async def check_names(state, audience: dict, api_key: str, *, transport=None) -> list[str]:
+    """What SalesQL makes of the names in an audience: one line per name it
+    doesn't know. Names picked from its lists are already known and cost no
+    lookup. Free."""
     notes: list[str] = []
+    todo = []
+    for field, (kind, _, word) in LOOKUP_FIELDS.items():
+        for name in audience[field]["include"] + audience[field]["exclude"]:
+            if kind == "country":
+                name = COUNTRY_ALIASES.get(name.lower(), name)
+            cached = await state.get_setting(f"salesql:lookup:{kind}:{name.lower()}", "")
+            if not cached or cached == "-":
+                todo.append((kind, word, name))
+    if not todo:
+        return notes
     async with sq.SalesQL(api_key, transport=transport) as client:
-        for field, kind, word in (("states", "region", "state"), ("countries", "country", "country"),
-                                  ("industries", "industry", "industry")):
-            for name in values[field]:
-                if kind == "country":
-                    name = COUNTRY_ALIASES.get(name.lower(), name)
-                found = await client.lookup(kind, q=name, size=10)
-                labels = [v["label"] for v in found]
-                if any(label.lower() == name.lower() for label in labels):
-                    continue
-                if kind == "industry" and labels:
-                    notes.append(f"Industry \"{name}\" will be read as \"{labels[0]}\""
-                                 + (f" (others: {', '.join(labels[1:4])})" if labels[1:] else "")
-                                 + ".")
-                elif labels:
-                    notes.append(f"SalesQL has no {word} called \"{name}\". "
-                                 f"Closest: {', '.join(labels[:4])}.")
-                else:
-                    notes.append(f"SalesQL has no {word} called \"{name}\"."
-                                 + (" It lists states, not cities: put a city under Cities."
-                                    if kind == "region" else ""))
+        for kind, word, name in todo:
+            found = await client.lookup(kind, q=name, size=10)
+            match = next((v for v in found if v["label"].lower() == name.lower()), None)
+            if match:
+                await state.set_setting(f"salesql:lookup:{kind}:{name.lower()}", match["value"])
+                continue
+            labels = [v["label"] for v in found]
+            notes.append(f"SalesQL has no {word} called \"{name}\"."
+                         + (f" Closest: {', '.join(labels[:4])}." if labels else "")
+                         + (" It lists states, not cities: put a city under City."
+                            if kind == "region" and not labels else ""))
     return notes
 
 

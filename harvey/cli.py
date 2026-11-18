@@ -921,7 +921,7 @@ def cmd_salesql(args):
                   f"{account['credits']} credits left.\n")
             return 0
 
-        if action == "rules":
+        if action == "audience":
             import json as _json
             try:
                 config = load_config()
@@ -930,30 +930,16 @@ def cmd_salesql(args):
                 return 1
             if args.set:
                 try:
-                    await collector.set_rules(state, _json.loads(args.set))
+                    current = await collector.list_audiences(state, config)
+                    await collector.save_audience(
+                        state, {**current["audience"], **_json.loads(args.set)}, current["active"])
                 except ValueError as e:
                     print(f"\n  {e}\n")
                     return 1
-            rules = await collector.get_rules(state, config)
-            for r in rules:
-                print("  - " + collector.describe_rule(r))
-            print(_json.dumps(rules, indent=2))
-            return 0
-
-        if action == "settings":
-            import json as _json
-            try:
-                config = load_config()
-            except ConfigError as e:
-                print(f"\n  {e}\n")
-                return 1
-            if args.set:
-                try:
-                    await collector.set_search_settings(state, config, _json.loads(args.set))
-                except ValueError as e:
-                    print(f"\n  {e}\n")
-                    return 1
-            print(_json.dumps(await collector.search_settings(state, config), indent=2))
+            shown = await collector.list_audiences(state, config)
+            for item in shown["items"]:
+                print(("  * " if item["id"] == shown["active"] else "    ") + item["name"])
+            print(_json.dumps(shown["audience"], indent=2))
             return 0
 
         key = sq.key_from_env()
@@ -1312,12 +1298,13 @@ def main():
     sub = subparsers.add_parser(
         "salesql", help="Find people through SalesQL: search (free), then reveal the ones you pick")
     sub.add_argument("salesql_action", nargs="?", default="status",
-                     choices=["status", "connect", "settings", "rules", "search", "list", "reveal"],
-                     help="show the status (default), connect a key, show or change who a "
-                          "search looks for, search, list who was found, or reveal contacts")
+                     choices=["status", "connect", "audience", "search", "list", "reveal"],
+                     help="show the status (default), connect a key, show or change the "
+                          "audience a search looks for, search, list who was found, or reveal "
+                          "contacts")
     sub.add_argument("--set", default="", metavar="JSON",
-                     help='settings or rules: change them, e.g. settings --set \'{"states": '
-                          '["California"]}\'; rules --set takes the whole list of rules')
+                     help='audience: change parts of the active one, e.g. --set '
+                          '\'{"states": {"include": ["California"], "exclude": []}}\'')
     sub.add_argument("ids", nargs="*", help="reveal: ids from 'harvey salesql list'")
     sub.add_argument("--qualified", action="store_true",
                      help="reveal: everyone graded qualified")
