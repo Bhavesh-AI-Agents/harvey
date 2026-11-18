@@ -736,9 +736,12 @@ class SalesQLConfig(BaseModel):
     company_sizes: list[str] = []
     # Countries by name. Empty: the countries named in icp.geography.
     countries: list[str] = []
-    # States or cities by name ("California"). Both the person and the
-    # company must be there. Empty: anywhere in the countries above.
+    # States or regions by full name ("California"), not cities. Both the
+    # person and the company must be there. Empty: anywhere in the countries.
     states: list[str] = []
+    # Cities ("Boston"). SalesQL filters by state only, so Harvey keeps the
+    # people whose profile location names one of these. Set the state too.
+    cities: list[str] = []
     # A title or headline containing one of these marks the person as
     # technical, and anyone who ever held one of these titles is left out of
     # the search. Empty the list to keep technical people in.

@@ -89,10 +89,12 @@ class FakeSalesQL:
                 return {"values": [{"value": US, "label": "United States"}]
                         if params.get("q") == "United States" else []}
             if params["type"] == "region":
-                return {"values": [{"value": "r-ca-city", "label": "California City, California"},
-                                   {"value": "r-ca", "label": "California, United States"}]
+                return {"values": [{"value": "r-bc", "label": "Baja California"},
+                                   {"value": "r-ca", "label": "California"}]
                         if params.get("q") == "California" else []}
             if params["type"] == "industry":
+                if getattr(self, "no_industry", False):
+                    return {"values": []}
                 return {"values": [{"value": "financial-services", "label": "Financial Services"}]}
             return {"values": []}
         if name == "search_organizations":
@@ -527,7 +529,7 @@ async def test_a_state_narrows_both_the_person_and_the_company(state):
 @pytest.mark.asyncio
 async def test_an_unknown_state_stops_the_search_instead_of_widening_it(state):
     fake = FakeSalesQL()
-    with pytest.raises(sq.SalesQLError, match="salesql.states"):
+    with pytest.raises(sq.SalesQLError, match="not cities"):
         await collector.search(state, make_config(states=["Atlantis"]), KEY,
                                transport=fake.transport)
     assert not fake.tools("search_people")
@@ -584,3 +586,37 @@ async def test_searching_again_reads_the_next_page(state):
     await collector.set_search_settings(state, config, {"job_titles": ["President"]})
     await collector.search(state, config, KEY, transport=fake.transport)
     assert fake.tools("search_people")[-1]["params"]["page"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_city_is_matched_against_each_persons_location(state):
+    fake = FakeSalesQL()
+    config = make_config(require_no_developers=False, cities=["springfield"])
+    out = await collector.search(state, config, KEY, transport=fake.transport)
+    assert out["found"] == len(PEOPLE) and not any("outside" in n for n in out["notes"])
+    fake2 = FakeSalesQL()
+    out = await collector.search(state, make_config(require_no_developers=False, cities=["Boston"]),
+                                 KEY, transport=fake2.transport)
+    assert out["found"] == 0 and any("outside Boston" in n for n in out["notes"])
+
+
+@pytest.mark.asyncio
+async def test_unknown_industries_stop_the_search(state):
+    fake = FakeSalesQL()
+    fake.no_industry = True
+    with pytest.raises(sq.SalesQLError, match="LinkedIn's industry names"):
+        await collector.search(state, make_config(industries=["merchant services"]), KEY,
+                               transport=fake.transport)
+    assert not fake.tools("search_people")
+
+
+@pytest.mark.asyncio
+async def test_saved_names_are_checked_with_salesql(state):
+    fake = FakeSalesQL()
+    config = make_config()
+    await collector.set_search_settings(state, config, {
+        "states": ["California", "Boston"], "countries": ["US"], "industries": ["finance"]})
+    notes = await collector.check_names(state, config, KEY, transport=fake.transport)
+    assert len(notes) == 2
+    assert any("no state called \"Boston\"" in n and "Cities" in n for n in notes)
+    assert any("\"finance\" will be read as \"Financial Services\"" in n for n in notes)

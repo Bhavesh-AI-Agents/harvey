@@ -748,7 +748,8 @@ salesql:
   industries: []              # SalesQL industry names; empty: icp.industries
   company_sizes: []           # "1-10", "11-50", ...; empty: from icp.company_size
   countries: []               # empty: the countries in icp.geography
-  states: []                  # e.g. ["California"]: the person and the company must be there
+  states: []                  # full state names, e.g. ["California"]; SalesQL lists states, not cities
+  cities: []                  # e.g. ["Boston"]: kept by the location on each profile; set the state too
   require_no_developers: true # false keeps companies with their own developers
   technical_words: [engineer, developer, programmer, cto, ...]
 ```
