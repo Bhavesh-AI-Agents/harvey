@@ -101,7 +101,7 @@ class FakeSalesQL:
             return {"results": [{"uuid": "o-1", "name": "Northvale Payments"},
                                 {"uuid": "o-2", "name": "Lakeside Merchant Co"}], "total": 2}
         if name == "search_people":
-            if "past_job_titles" in params:      # the candidate search
+            if "past_job_titles" in params or "organization_uuids" not in params:   # candidates
                 return {"results": PEOPLE, "total": 1234}
             total = self.dev_total if self.dev_total is not None else len(self.developers)
             return {"results": self.developers, "total": total}
@@ -682,3 +682,79 @@ async def test_collecting_stops_short_of_the_days_lookups_and_resumes(state):
     server.per_day = 1000
     out = await collector.collect_catalogs(state, KEY, transport=server.transport, sleep=_no_sleep)
     assert out["complete"] and out["lookups"] == 26 * 3 - 30
+
+
+# ── rules ──
+
+@pytest.mark.asyncio
+async def test_until_rules_are_saved_they_come_from_the_file(state):
+    rules = await collector.get_rules(state, make_config())
+    assert [r["id"] for r in rules] == ["not-technical", "never-technical", "no-developers"]
+    assert "software job title" in collector.describe_rule(rules[2])
+    off = await collector.get_rules(state, make_config(require_no_developers=False,
+                                                       technical_words=[]))
+    assert off == []
+
+
+@pytest.mark.asyncio
+async def test_saved_rules_decide_the_search_and_the_grades(state):
+    config = make_config()
+    await collector.set_rules(state, [
+        {"kind": "person_words", "where": "company_name", "mode": "has_none",
+         "words": ["Lakeside"]},
+        {"kind": "filter", "filter": "has_phone"},
+        {"kind": "filter", "filter": "founded_from", "value": "2015"},
+        {"kind": "filter", "filter": "founded_to", "value": 2024},
+        {"kind": "filter", "filter": "exclude_titles", "value": ["Intern", "Assistant"]},
+    ])
+    fake = FakeSalesQL()
+    out = await collector.search(state, config, KEY, transport=fake.transport)
+    sent = fake.tools("search_people")[0]["params"]
+    assert sent["has_phones"] is True
+    assert sent["organization_founded_years"] == {"gte": 2015, "lte": 2024}
+    assert sent["job_titles"] == {"include": ["Founder", "Owner"], "exclude": ["Intern", "Assistant"]}
+    assert "past_job_titles" not in sent              # the file's rules no longer apply
+    assert len(fake.tools("search_people")) == 1      # no company rule, so no staff check
+    rows = {r["id"]: r for r in await state.get_salesql_candidates()}
+    assert rows["p-ben"]["grade"] == "rejected" and "\"lakeside\" in the company name" in rows["p-ben"]["reason"]
+    assert rows["p-ada"]["grade"] == "qualified" and out["rejected"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_several_company_rules_each_get_their_own_check(state):
+    config = make_config()
+    await collector.set_rules(state, [
+        {"id": "no-dev", "kind": "company_staff", "mode": "none", "label": "software",
+         "titles": ["Developer"]},
+        {"id": "has-sales", "kind": "company_staff", "mode": "some", "label": "sales",
+         "titles": ["Sales Manager"]},
+    ])
+    fake = FakeSalesQL(developers=[])
+    await collector.search(state, config, KEY, transport=fake.transport)
+    checks = [c["params"]["job_titles"]["include"] for c in fake.tools("search_people")[1:]]
+    assert ["Developer"] in checks and ["Sales Manager"] in checks
+    rows = await state.get_salesql_candidates()
+    assert rows and all(r["grade"] == "rejected" and "Nobody with a sales job title" in r["reason"]
+                        for r in rows if r["org_uuid"] and r["grade"] != "unsure"
+                        and "technical" not in r["reason"] and "work email" not in r["reason"])
+
+
+@pytest.mark.parametrize("bad", [
+    "x", [{"kind": "nope"}], [{"kind": "person_words", "where": "shoe", "mode": "has_any", "words": ["a"]}],
+    [{"kind": "person_words", "where": "title", "mode": "has_any", "words": []}],
+    [{"kind": "company_staff", "mode": "maybe", "titles": ["a"]}],
+    [{"kind": "filter", "filter": "drop_table"}],
+    [{"kind": "filter", "filter": "founded_from", "value": "soon"}],
+    [{"id": "a", "kind": "filter", "filter": "has_phone"}, {"id": "a", "kind": "filter", "filter": "has_phone"}],
+    [{"kind": "filter", "filter": "has_phone"}] * 21])
+def test_rules_that_make_no_sense_are_refused(bad):
+    with pytest.raises(ValueError):
+        collector.clean_rules(bad)
+
+
+def test_every_filter_has_a_label_and_reads_as_a_sentence():
+    assert set(collector.FILTERS) == set(collector.FILTER_LABELS)
+    for name, (_, how) in collector.FILTERS.items():
+        value = True if how == "flag" else 5 if how in ("gte", "lte") else ["Intern"]
+        rule = collector.clean_rules([{"kind": "filter", "filter": name, "value": value}])[0]
+        assert collector.describe_rule(rule).endswith(".")

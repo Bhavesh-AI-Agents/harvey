@@ -798,6 +798,12 @@ async def salesql_overview():
         out["cap"] = await collector.daily_cap(state, config)
         out["left_today"] = await collector.reveals_left_today(state, config)
         out["search"] = await collector.search_settings(state, config)
+        out["rules"] = [{**r, "text": collector.describe_rule(r)}
+                        for r in await collector.get_rules(state, config)]
+        out["rule_options"] = {
+            "where": collector.WHERE,
+            "filters": {k: {"label": v, "takes": collector.FILTERS[k][1]}
+                        for k, v in collector.FILTER_LABELS.items()}}
         out["sizes"] = [r[0] for r in collector.SIZE_RANGES]
     except Exception:
         config = None
@@ -809,6 +815,12 @@ async def salesql_overview():
                 out["account"] = await client.account_status()
         except sq.SalesQLError as e:
             out["error"] = str(e)
+    seen: dict[str, int] = {}
+    for r in await state.get_salesql_candidates(limit=500):
+        title = (r["title"] or "").strip()
+        if title and len(title) <= 60:
+            seen[title] = seen.get(title, 0) + 1
+    out["titles_seen"] = [t for t, _ in sorted(seen.items(), key=lambda x: (-x[1], x[0]))[:30]]
     out["candidates"] = [_salesql_row(r)
                          for r in await state.get_salesql_candidates(status="found")]
     out["handled"] = [_salesql_row(r) for r in await state.get_salesql_candidates(limit=200)
@@ -907,6 +919,26 @@ async def salesql_catalog():
         running = True
     return {"lists": lists, "complete": complete, "collecting": running,
             "note": "" if running or complete else _catalog_note}
+
+
+@app.post("/api/salesql/rules")
+async def salesql_rules(request: Request):
+    """Save the rules that decide who is a good prospect."""
+    from harvey.collectors import salesql as collector
+    try:
+        data = await request.json()
+    except Exception:
+        data = None
+    state = _state()
+    await state.init_db()
+    try:
+        rules = await collector.set_rules(state, data.get("rules") if isinstance(data, dict)
+                                          else None)
+    except ValueError as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=400)
+    await state.log_action("salesql_rules", "dashboard", {"rules": len(rules)})
+    return {"success": True,
+            "rules": [{**r, "text": collector.describe_rule(r)} for r in rules]}
 
 
 @app.post("/api/salesql/lookup")
