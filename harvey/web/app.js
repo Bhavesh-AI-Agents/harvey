@@ -1175,13 +1175,68 @@ async function loadSalesql() {
 // Who a search looks for. Lists are typed with commas between entries.
 const SALESQL_LISTS = [
   ['job_titles', 'Job titles', 'Founder, Owner, CEO'],
-  ['states', 'States (full name)', 'California, Massachusetts (empty: the whole country)'],
-  ['cities', 'Cities', 'Boston (optional; set the state too)'],
-  ['countries', 'Countries', 'United States'],
-  ['industries', 'Industries (LinkedIn names)', 'Financial Services, Retail, Real Estate (empty: any industry)'],
+  ['cities', 'Cities', 'Boston (optional; pick the state too)'],
   ['company_keywords', 'Words in the company name',
    'merchant services (when set, used in place of industries)'],
 ];
+// Picked from SalesQL's own lists, so a name can't be mistyped.
+const SALESQL_PICKS = [
+  ['countries', 'country', 'Countries', 'Type to search, e.g. United'],
+  ['states', 'region', 'States', 'Type to search, e.g. Calif (empty: the whole country)'],
+  ['industries', 'industry', 'Industries', 'Type to search, e.g. retail (empty: any industry)'],
+];
+let _sqPicked = {};      // field -> names chosen
+let _sqOffered = {};     // field -> names SalesQL offered for what was typed
+let _sqTimer = null;
+
+function salesqlChips(field) {
+  const names = _sqPicked[field] || [];
+  return names.length ? names.map((name, i) => '<span class="tag" style="margin:0 6px 6px 0">' +
+    escHtml(name) + ' <a href="#" aria-label="Remove ' + escHtml(name) + '" style="margin-left:4px" ' +
+    'onclick="dropSalesqlPick(\'' + field + '\',' + i + ');return false">&times;</a></span>').join('')
+    : '<span class="muted">None chosen</span>';
+}
+
+function dropSalesqlPick(field, i) {
+  (_sqPicked[field] || []).splice(i, 1);
+  const el = document.getElementById('sq-chips-' + field);
+  if (el) el.innerHTML = salesqlChips(field);
+}
+
+function addSalesqlPick(field, i) {
+  const name = (_sqOffered[field] || [])[i];
+  if (!name) return;
+  _sqPicked[field] = _sqPicked[field] || [];
+  if (!_sqPicked[field].includes(name)) _sqPicked[field].push(name);
+  const chips = document.getElementById('sq-chips-' + field);
+  if (chips) chips.innerHTML = salesqlChips(field);
+  const input = document.getElementById('sq-find-' + field);
+  if (input) { input.value = ''; input.focus(); }
+  const list = document.getElementById('sq-offer-' + field);
+  if (list) list.innerHTML = '';
+}
+
+function suggestSalesql(field, kind) {
+  clearTimeout(_sqTimer);
+  const input = document.getElementById('sq-find-' + field);
+  const list = document.getElementById('sq-offer-' + field);
+  if (!input || !list) return;
+  const q = input.value.trim();
+  if (q.length < 2) { list.innerHTML = ''; return; }
+  _sqTimer = setTimeout(async () => {
+    const data = await api('/api/salesql/lookup', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({kind: kind, q: q}),
+    });
+    if (input.value.trim() !== q) return;    // they kept typing
+    const names = (data && data.values) || [];
+    _sqOffered[field] = names;
+    list.innerHTML = names.length
+      ? names.map((name, i) => '<a href="#" class="tag accent" style="margin:6px 6px 0 0" ' +
+          'onclick="addSalesqlPick(\'' + field + '\',' + i + ');return false">+ ' + escHtml(name) + '</a>').join('')
+      : '<span class="muted">' + escHtml((data && data.message) || 'SalesQL has nothing called that.') + '</span>';
+  }, 300);
+}
 
 function salesqlSettingsForm(search, sizes) {
   if (!search) return '';
@@ -1192,10 +1247,21 @@ function salesqlSettingsForm(search, sizes) {
     ' &middot; ' + escHtml((search.company_sizes || []).join(', ') || 'any size') + ' employees &middot; ' +
     escHtml((search.states || []).concat(search.states && search.states.length ? [] : search.countries || [])
       .join(', ') || 'anywhere') + '</span></summary><div style="margin-top:12px">';
-  SALESQL_LISTS.forEach(([field, label, hint]) => {
-    html += '<div class="form-group"><label class="form-label" for="sq-' + field + '">' + label +
-      '</label><input class="form-input" id="sq-' + field + '" type="text" autocomplete="off" ' +
-      'placeholder="' + escHtml(hint) + '" value="' + escHtml((search[field] || []).join(', ')) + '"></div>';
+  const typed = ([field, label, hint]) =>
+    '<div class="form-group"><label class="form-label" for="sq-' + field + '">' + label +
+    '</label><input class="form-input" id="sq-' + field + '" type="text" autocomplete="off" ' +
+    'placeholder="' + escHtml(hint) + '" value="' + escHtml((search[field] || []).join(', ')) + '"></div>';
+  const picked = ([field, kind, label, hint]) => {
+    _sqPicked[field] = (search[field] || []).slice();
+    return '<div class="form-group"><label class="form-label" for="sq-find-' + field + '">' + label +
+      '</label><div id="sq-chips-' + field + '" style="margin-bottom:6px">' + salesqlChips(field) + '</div>' +
+      '<input class="form-input" id="sq-find-' + field + '" type="text" autocomplete="off" placeholder="' +
+      escHtml(hint) + '" oninput="suggestSalesql(\'' + field + '\',\'' + kind + '\')">' +
+      '<div id="sq-offer-' + field + '"></div></div>';
+  };
+  ['job_titles', 'countries', 'states', 'cities', 'industries', 'company_keywords'].forEach(field => {
+    const t = SALESQL_LISTS.find(x => x[0] === field);
+    html += t ? typed(t) : picked(SALESQL_PICKS.find(x => x[0] === field));
   });
   html += '<div class="form-group"><span class="form-label">Company size (employees)</span><div>' +
     (sizes || []).map(size => '<label style="display:inline-block;margin:0 14px 6px 0">' +
@@ -1225,6 +1291,7 @@ async function saveSalesqlSettings() {
     const el = document.getElementById('sq-' + field);
     if (el) body[field] = el.value.split(',').map(v => v.trim()).filter(Boolean);
   });
+  SALESQL_PICKS.forEach(([field]) => { body[field] = (_sqPicked[field] || []).slice(); });
   body.company_sizes = [...document.querySelectorAll('.sq-size:checked')].map(c => c.value);
   body.require_no_developers = !!(document.getElementById('sq-nodevs') || {}).checked;
   body.page_size = parseInt((document.getElementById('sq-page') || {}).value, 10);

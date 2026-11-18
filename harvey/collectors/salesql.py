@@ -428,6 +428,22 @@ async def set_search_settings(state, config, data) -> dict:
     return await search_settings(state, config)
 
 
+async def suggest(state, api_key: str, kind: str, q: str, *, transport=None) -> list[str]:
+    """SalesQL's names for what was typed ("calif" -> ["California", ...]).
+    Free. Each name's identifier is remembered, so a search needs no second
+    lookup for a name picked from this list."""
+    async with sq.SalesQL(api_key, transport=transport) as client:
+        found = await client.lookup(kind, q=q, size=20)
+    names: list[str] = []
+    for v in found:
+        label = v["label"]
+        if not label or label in names:
+            continue        # SalesQL lists a few names twice; the first one is used
+        names.append(label)
+        await state.set_setting(f"salesql:lookup:{kind}:{label.lower()}", v["value"])
+    return names
+
+
 async def check_names(state, config, api_key: str, *, transport=None) -> list[str]:
     """What SalesQL makes of the saved states, countries and industries: one
     line per name it doesn't know or reads as something else. Free."""

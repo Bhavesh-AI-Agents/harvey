@@ -112,3 +112,27 @@ def test_bad_search_settings_are_refused_with_a_reason(client):
     r = client.post("/api/salesql/settings", json={"company_sizes": ["tiny"]})
     assert r.status_code == 400 and "Company sizes" in r.json()["message"]
     assert client.post("/api/salesql/settings", json={"job_titles": []}).status_code == 400
+
+
+def test_typing_offers_salesqls_own_names(client, monkeypatch):
+    monkeypatch.setenv("SALESQL_API_KEY", "sq_abc")
+
+    async def fake_lookup(self, kind, q="", size=20):
+        assert (kind, q) == ("region", "calif")
+        return [{"value": "r-ca", "label": "California"}, {"value": "r-bc", "label": "Baja California"},
+                {"value": "r-bc2", "label": "Baja California"}]
+    monkeypatch.setattr(sq.SalesQL, "lookup", fake_lookup)
+    r = client.post("/api/salesql/lookup", json={"kind": "region", "q": "calif"}).json()
+    assert r["values"] == ["California", "Baja California"]
+
+
+@pytest.mark.parametrize("body", [{"kind": "city", "q": "bo"}, {"kind": "region", "q": "b"},
+                                  {"kind": "region"}, "x"])
+def test_a_lookup_needs_a_known_list_and_two_letters(client, monkeypatch, body):
+    monkeypatch.setenv("SALESQL_API_KEY", "sq_abc")
+    assert client.post("/api/salesql/lookup", json=body).status_code == 400
+
+
+def test_a_lookup_needs_salesql_connected(client):
+    r = client.post("/api/salesql/lookup", json={"kind": "region", "q": "calif"})
+    assert r.status_code == 400 and "Connect" in r.json()["message"]
