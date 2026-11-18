@@ -179,6 +179,9 @@ async def decide_next_action(
     elif unusable_backlog_notice(summary):
         action, reason = "idle", "a day's worth of prospects with no usable email"
         logger.warning(unusable_backlog_notice(summary))
+    elif not getattr(getattr(config, "usage", None), "auto_prospect", True):
+        # The operator brings their own contacts; Harvey doesn't go looking.
+        action, reason = "idle", "nobody new to write to, and finding prospects by itself is off"
     else:
         action, reason = "prospect", f"{new_prospects} new prospect(s), none ready to write for"
 
@@ -487,11 +490,9 @@ def _needs_setup() -> bool:
     from harvey.paths import PROJECT_ROOT
     from harvey.config import _find_config_file, ConfigFileNotFoundError
 
-    env_file = PROJECT_ROOT / ".env"
-
-    # If .env doesn't exist, definitely needs setup
-    if not env_file.exists():
-        return True
+    # A missing .env alone doesn't mean "not set up": on a server the keys
+    # come from the service's environment. What Harvey can't run without is
+    # the business it writes for, checked below.
 
     # harvey.local.yaml wins over the tracked harvey.yaml template, same
     # resolution order the real config loader uses (see config.py).

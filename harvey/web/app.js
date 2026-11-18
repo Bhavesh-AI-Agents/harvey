@@ -1387,7 +1387,90 @@ function pageCohort(dir) {
 
 // ── Settings ──
 
+// Settings > Your business: who Harvey writes as and what it sells.
+const BUSINESS_FIELDS = [
+  ['Who the emails come from', [
+    ['sender_name', 'Your name', 'text', 'The real person who signs the emails'],
+    ['sender_role', 'Your role', 'text', 'Founder'],
+    ['sender_email', 'Your email address', 'text', 'you@yourdomain.com'],
+    ['company', 'Company name', 'text', ''],
+    ['tone', 'Tone of voice', 'text', 'plain, direct, friendly'],
+  ]],
+  ['What you are selling', [
+    ['product_name', 'Product or service name', 'text', ''],
+    ['product_description', 'What it is and who it is for', 'area', 'Two or three plain sentences. Harvey writes from this, so say only what is true.'],
+    ['pricing', 'Pricing, as you would state it to a prospect', 'area', 'Leave empty if emails should not mention price'],
+    ['key_benefits', 'Main benefits, one per line', 'lines', 'Only claims you can stand behind'],
+  ]],
+  ['The offer and the meeting', [
+    ['offer_primary', 'Main offer', 'text', 'What they would buy'],
+    ['offer_entry', 'Easy first step', 'text', 'Free estimate, free audit, trial'],
+    ['goal', 'What an email should lead to', {book_call: 'Book a call', start_trial: 'Start a trial', get_reply: 'Get a reply'}],
+    ['booking_method', 'How a meeting is booked', {calendar_link: 'They pick a time from my booking link',
+      suggest_times: 'Harvey suggests times', ask_preference: 'Harvey asks what suits them'}],
+    ['booking_url', 'Booking link', 'text', 'https://… (needed for the booking-link option)'],
+    ['meeting_duration', 'Length of the call', 'text', '15 minutes'],
+    ['meeting_owner', 'Who takes the call', 'text', ''],
+  ]],
+  ['Required by law', [
+    ['postal_address', 'Postal address printed under every cold email', 'text', 'Street address, PO box or virtual mailbox. US law (CAN-SPAM) requires one.'],
+  ]],
+];
+
+async function loadBusiness() {
+  const el = document.getElementById('business-card');
+  if (!el) return;
+  const data = await api('/api/business');
+  if (!data) { el.innerHTML = offlineState(); return; }
+  let html = '<div class="card">' + (data.complete ? '' :
+    '<div class="banner wait" style="margin-bottom:14px"><div><p style="margin:0"><b>Not filled in yet.</b> ' +
+    'Harvey writes every email from what you put here, and will not start without it.</p></div></div>');
+  BUSINESS_FIELDS.forEach(([title, fields]) => {
+    html += '<h3 style="margin:14px 0 8px">' + title + '</h3>';
+    fields.forEach(([key, label, kind, hint]) => {
+      const value = data[key];
+      html += '<div class="form-group"><label class="form-label" for="biz-' + key + '">' + label + '</label>';
+      if (typeof kind === 'object') {
+        html += '<select class="form-input" id="biz-' + key + '">' + Object.keys(kind).map(k =>
+          '<option value="' + k + '"' + (k === value ? ' selected' : '') + '>' + escHtml(kind[k]) + '</option>').join('') + '</select>';
+      } else if (kind === 'area' || kind === 'lines') {
+        html += '<textarea class="form-input" id="biz-' + key + '" rows="' + (kind === 'lines' ? 4 : 3) +
+          '" style="height:auto;padding:8px 12px;line-height:1.5" placeholder="' + escHtml(hint || '') + '">' +
+          escHtml(kind === 'lines' ? (value || []).join('\n') : (value || '')) + '</textarea>';
+      } else {
+        html += '<input class="form-input" id="biz-' + key + '" type="text" autocomplete="off" placeholder="' +
+          escHtml(hint || '') + '" value="' + escHtml(value || '') + '">';
+      }
+      html += '</div>';
+    });
+  });
+  html += '<h3 style="margin:14px 0 8px">Finding people</h3>' +
+    '<label style="display:block;margin-bottom:6px"><input type="checkbox" id="biz-auto_prospect"' +
+    (data.auto_prospect ? ' checked' : '') + '> Let Harvey also search the web for new prospects by itself</label>' +
+    '<p class="desc" style="margin:0 0 12px">Off: Harvey only writes to the contacts you bring in, for example through ' +
+    'Discover > People. On: when it has nobody to write to, it looks for companies matching the ICP in harvey.yaml.</p>' +
+    '<button class="btn btn-primary" onclick="saveBusiness()">Save</button></div>';
+  el.innerHTML = html;
+}
+
+async function saveBusiness() {
+  const body = {};
+  BUSINESS_FIELDS.forEach(([, fields]) => fields.forEach(([key, , kind]) => {
+    const el = document.getElementById('biz-' + key);
+    if (!el) return;
+    body[key] = kind === 'lines' ? el.value.split('\n').map(v => v.trim()).filter(Boolean) : el.value;
+  }));
+  body.auto_prospect = !!(document.getElementById('biz-auto_prospect') || {}).checked;
+  const data = await api('/api/business', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+  });
+  showToast(data && data.success ? 'Saved. Harvey writes from this from its next cycle.'
+                                  : (data && data.message) || 'Could not save.', data && data.success ? 'success' : 'error');
+  if (data && data.success) loadBusiness();
+}
+
 async function loadSettings() {
+  loadBusiness();
   const data = await api('/api/settings');
   if (!data) return;
 

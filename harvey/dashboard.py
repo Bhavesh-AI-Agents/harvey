@@ -353,6 +353,32 @@ def _current_provider() -> str:
         return "instantly"
 
 
+@app.get("/api/business")
+async def business_get():
+    """Who Harvey writes as and what it sells, as the Settings form shows it."""
+    from harvey.config import business_profile
+    return business_profile()
+
+
+@app.post("/api/business")
+async def business_save(request: Request):
+    """Save the business profile into harvey.local.yaml."""
+    from harvey.config import ConfigError, business_profile, set_business_profile
+    try:
+        data = await request.json()
+    except Exception:
+        data = None
+    try:
+        path = set_business_profile(data)
+    except ConfigError as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=400)
+    except OSError as e:
+        logger.warning("Could not write the business profile: %s", e)
+        return JSONResponse({"success": False, "message": "Could not write the settings file."},
+                            status_code=500)
+    return {"success": True, "file": path.name, "profile": business_profile()}
+
+
 @app.get("/api/settings")
 async def get_settings():
     """Get current settings — presence flags only for secrets, never raw values."""
@@ -1354,7 +1380,9 @@ async def start_harvey():
     from harvey.main import _needs_setup
     if _needs_setup():
         return {"success": False,
-                "message": "Harvey isn't set up yet. Run `harvey setup` in a terminal first."}
+                "message": "Harvey isn't set up yet. Fill in Settings > Your business "
+                           "(who it writes as and what it sells), or run `harvey setup` "
+                           "in a terminal, then start it."}
 
     # Ensure data dir exists
     (PROJECT_ROOT / "data").mkdir(parents=True, exist_ok=True)
