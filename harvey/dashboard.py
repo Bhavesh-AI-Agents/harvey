@@ -815,10 +815,16 @@ async def salesql_overview():
         if title and len(title) <= 60:
             seen[title] = seen.get(title, 0) + 1
     out["titles_seen"] = [t for t, _ in sorted(seen.items(), key=lambda x: (-x[1], x[0]))[:30]]
-    out["candidates"] = [_salesql_row(r)
-                         for r in await state.get_salesql_candidates(status="found")]
-    out["handled"] = [_salesql_row(r) for r in await state.get_salesql_candidates(limit=200)
-                      if r["status"] != "found"][:50]
+    # Each audience has its own list of people. Those found before audiences
+    # existed, or whose audience was deleted, join the one in use.
+    active = (out.get("audiences") or {}).get("active") or ""
+    if active:
+        await state.adopt_salesql_candidates(active)
+    scope = active if (out.get("audiences") or {}).get("saved") else None
+    out["candidates"] = [_salesql_row(r) for r in await state.get_salesql_candidates(
+        status="found", audience_id=scope)]
+    out["handled"] = [_salesql_row(r) for r in await state.get_salesql_candidates(
+        limit=400, audience_id=scope) if r["status"] != "found"][:100]
     return out
 
 

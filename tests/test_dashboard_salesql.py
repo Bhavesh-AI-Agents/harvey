@@ -215,3 +215,16 @@ def test_a_model_that_does_not_answer_says_what_to_do(client, monkeypatch):
     r = client.post("/api/salesql/describe", json={"text": "Owners of small shops"})
     assert r.status_code == 400 and "harvey status --check" in r.json()["message"]
     assert client.post("/api/salesql/describe", json={"text": 5}).status_code == 400
+
+
+def test_the_people_shown_belong_to_the_audience_in_use(client, env):
+    import sqlite3
+    with sqlite3.connect(env["db"]) as db:
+        db.execute("INSERT INTO salesql_candidates (id, full_name, status, grade) "
+                   "VALUES ('p-1', 'Ada Example', 'found', 'qualified')")
+    first = client.post("/api/salesql/audience", json={"audience": AUDIENCE}).json()["audiences"]["active"]
+    assert [r["id"] for r in client.get("/api/salesql").json()["candidates"]] == ["p-1"]
+    client.post("/api/salesql/audience", json={"audience": {**AUDIENCE, "name": "Second"}})
+    assert client.get("/api/salesql").json()["candidates"] == []
+    client.post("/api/salesql/audience/select", json={"id": first})
+    assert [r["id"] for r in client.get("/api/salesql").json()["candidates"]] == ["p-1"]

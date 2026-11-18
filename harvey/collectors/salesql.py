@@ -771,9 +771,13 @@ async def save_audience(state, audience, audience_id: str = "") -> str:
     taken = {v["name"].lower() for k, v in data["items"].items() if k != audience_id}
     if clean["name"].lower() in taken:
         raise ValueError(f"Another audience is already called \"{clean['name']}\".")
+    first = not data["items"]
     data["items"][audience_id] = clean
     data["active"] = audience_id
     await state.set_setting(AUDIENCES_KEY, json.dumps(data))
+    if first:
+        # People found before audiences existed belong to the first one.
+        await state.adopt_salesql_candidates(audience_id)
     return audience_id
 
 
@@ -793,6 +797,15 @@ async def delete_audience(state, audience_id: str) -> None:
     if data["active"] == audience_id:
         data["active"] = next(iter(data["items"]), "")
     await state.set_setting(AUDIENCES_KEY, json.dumps(data))
+    # Its people are kept: those still waiting go back to no audience, and
+    # join whichever audience is used next. Nobody already revealed is lost.
+    for row in await state.get_salesql_candidates(audience_id=audience_id, limit=5000):
+        await state.update_salesql_candidate(row["id"], audience_id="")
+
+
+async def active_audience_id(state) -> str:
+    """The id of the audience searches use ("" before any is saved)."""
+    return (await _audiences(state))["active"]
 
 
 async def _engine_inputs(state, config):
@@ -1004,23 +1017,20 @@ async def search(state, config, api_key: str, *, transport=None) -> dict:
     summary = {"found": len(people), "total": found["total"], "new": 0,
                "qualified": 0, "unsure": 0, "rejected": 0, "notes": notes}
     counted = next((r["id"] for r in staff_rules if r["mode"] == "none"), "")
+    audience_id = await active_audience_id(state)
     for p in people:
         grade, reason = grade_by_rules(p, rules, allowed_sizes=sizes, staff=staff)
         dev_count = staff.get(counted, {}).get(p["org_uuid"]) if counted else None
-        p.update(grade=grade, reason=reason, dev_count=dev_count)
+        p.update(grade=grade, reason=reason, dev_count=dev_count, audience_id=audience_id)
         if await state.upsert_salesql_candidate(p):
             summary["new"] += 1
         summary[grade] += 1
-    # People from earlier searches are held to the audience as it is now, as
-    # far as that needs no new lookup: someone a changed or stricter audience
-    # no longer fits should not stay under Qualified.
-    # Only with a single audience: people are not tagged with the audience
-    # that found them, so with several this would judge one audience's
-    # people by another's rules.
+    # People this audience found earlier are held to it as it is now, as far
+    # as that needs no new lookup: someone a changed or stricter audience no
+    # longer fits should not stay under Qualified.
     seen = {p["id"] for p in people}
     moved = 0
-    single = len((await _audiences(state))["items"]) <= 1
-    for row in (await state.get_salesql_candidates(status="found")) if single else []:
+    for row in await state.get_salesql_candidates(status="found", audience_id=audience_id):
         if row["id"] in seen or row["grade"] != "qualified":
             continue
         grade, reason = grade_by_rules(row, rules, allowed_sizes=sizes, staff={})
