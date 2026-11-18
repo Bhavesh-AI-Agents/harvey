@@ -10,6 +10,7 @@ upgrade cleanly in place.
 """
 
 import json
+import sqlite3
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -590,6 +591,32 @@ _CONVERSATION_COLUMNS = frozenset({
 })
 
 
+def _statements(script: str) -> list[str]:
+    """A migration script as single statements (a trigger body stays whole)."""
+    out, current = [], ""
+    for line in script.splitlines(keepends=True):
+        current += line
+        if sqlite3.complete_statement(current):
+            out.append(current.strip())
+            current = ""
+    rest = "\n".join(part for part in current.splitlines()
+                     if part.strip() and not part.strip().startswith("--"))
+    if rest.strip():
+        out.append(current.strip())
+    return out
+
+
+def _already_there(statement: str, error: Exception) -> bool:
+    """True when a statement failed only because an earlier, interrupted
+    upgrade had already added that column. Older versions could stop between
+    adding a column and recording the step, which left the database unable
+    to upgrade; skipping the column lets the rest of the step finish."""
+    body = " ".join(part for part in statement.splitlines()
+                    if not part.strip().startswith("--")).strip().upper()
+    return "duplicate column name" in str(error).lower() \
+        and body.startswith("ALTER TABLE") and " ADD COLUMN " in body
+
+
 class StateManager:
     def __init__(self, db_path: str | None = None):
         self.db_path = db_path or str(DB_PATH)
@@ -618,12 +645,32 @@ class StateManager:
 
             async with db.execute("PRAGMA user_version") as cursor:
                 (version,) = await cursor.fetchone()
+            if version >= len(MIGRATIONS):
+                return
 
+            # Each step and its version number are written together, under
+            # the write lock, so a step is applied fully or not at all, and
+            # two processes starting at once can't both apply it.
             for target, script in enumerate(MIGRATIONS, start=1):
-                if version < target:
-                    await db.executescript(script)
-                    await db.execute(f"PRAGMA user_version = {target}")
+                if version >= target:
+                    continue
+                await db.execute("BEGIN IMMEDIATE")
+                try:
+                    async with db.execute("PRAGMA user_version") as cursor:
+                        (version,) = await cursor.fetchone()
+                    if version < target:
+                        for statement in _statements(script):
+                            try:
+                                await db.execute(statement)
+                            except sqlite3.OperationalError as e:
+                                if not _already_there(statement, e):
+                                    raise
+                        await db.execute(f"PRAGMA user_version = {target}")
+                        version = target
                     await db.commit()
+                except BaseException:
+                    await db.rollback()
+                    raise
 
     # ── Companies ──
 
