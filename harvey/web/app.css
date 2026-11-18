@@ -944,13 +944,24 @@ textarea.form-input { height: auto; padding: 8px 12px; }
   background: var(--surface); border-radius: var(--r-lg); box-shadow: var(--shadow-border);
 }
 
+#toasts {
+  position: fixed; bottom: var(--sp-5); right: var(--sp-5); z-index: 60;
+  display: flex; flex-direction: column; gap: var(--sp-2); align-items: flex-end;
+  max-width: min(460px, calc(100vw - 2 * var(--sp-4))); pointer-events: none;
+}
 .toast {
-  position: fixed; bottom: var(--sp-5); right: var(--sp-5); z-index: 60; max-width: 420px;
-  padding: 10px 14px; border-radius: var(--r-md); font-size: var(--fs-ui); font-weight: 500;
-  box-shadow: var(--shadow-pop);
+  display: flex; align-items: flex-start; gap: var(--sp-2); pointer-events: auto;
+  padding: 10px 8px 10px 14px; border-radius: var(--r-md); font-size: var(--fs-ui); font-weight: 500;
+  box-shadow: var(--shadow-pop); user-select: text;
   transition-property: opacity, translate; transition-duration: 250ms; transition-timing-function: var(--ease-out);
   @starting-style { opacity: 0; translate: 0 8px; }
 }
+.toast > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.toast-close {
+  flex: none; width: 22px; height: 22px; margin-top: -1px; padding: 0; border: 0; border-radius: var(--r-sm);
+  background: none; color: inherit; opacity: 0.75; cursor: pointer; font: 400 18px/1 var(--sans);
+}
+.toast-close:hover, .toast-close:focus-visible { opacity: 1; background: rgb(255 255 255 / 0.18); outline: none; }
 .toast.success { background: var(--text); color: var(--bg); }
 .toast.error { background: var(--bad); color: #fff; }
 
