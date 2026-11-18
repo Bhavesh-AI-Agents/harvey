@@ -136,3 +136,28 @@ def test_a_lookup_needs_a_known_list_and_two_letters(client, monkeypatch, body):
 def test_a_lookup_needs_salesql_connected(client):
     r = client.post("/api/salesql/lookup", json={"kind": "region", "q": "calif"})
     assert r.status_code == 400 and "Connect" in r.json()["message"]
+
+
+def test_the_lists_are_served_and_collecting_starts_once_connected(client, monkeypatch):
+    from harvey.collectors import salesql as collector
+    started = []
+
+    async def fake_collect(state, key, **kw):
+        started.append(key)
+        return {"lookups": 0, "complete": False, "stopped": "The rest is collected tomorrow."}
+    monkeypatch.setattr(collector, "collect_catalogs", fake_collect)
+    monkeypatch.setattr(dash, "_catalog_task", None)
+    monkeypatch.setattr(dash, "_catalog_retry_at", 0.0)
+    first = client.get("/api/salesql/catalog").json()
+    assert first["collecting"] is False and not started            # no key yet
+    assert first["lists"]["industry"] == {"values": [], "complete": False}
+    monkeypatch.setenv("SALESQL_API_KEY", "sq_abc")
+    assert client.get("/api/salesql/catalog").json()["collecting"] is True
+    import time
+    for _ in range(50):
+        if dash._catalog_task.done():
+            break
+        time.sleep(0.02)
+    after = client.get("/api/salesql/catalog").json()
+    assert started == ["sq_abc"]                                   # not started again at once
+    assert after["collecting"] is False and "tomorrow" in after["note"]

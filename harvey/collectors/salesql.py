@@ -428,6 +428,101 @@ async def set_search_settings(state, config, data) -> dict:
     return await search_settings(state, config)
 
 
+# ── SalesQL's own lists of industries, regions and countries ──
+#
+# SalesQL never returns a list whole: its lookup answers a typed query with at
+# most 100 names, matching the start of any word. So Harvey collects a list
+# once, one letter at a time, splitting a letter that comes back full into
+# longer queries (three letters at most), and keeps it. Lookups are free but rate limited per
+# minute and per day, so collecting is paced, stops well short of the day's
+# allowance, and picks up where it left off.
+
+CATALOG_KINDS = ("industry", "region", "country")
+LETTERS = "abcdefghijklmnopqrstuvwxyz"
+LOOKUP_PAGE = 100
+CATALOG_DAY_SHARE = 0.6        # of the day's lookups; the rest is for searches
+
+
+def _catalog_key(kind: str) -> str:
+    return f"salesql:catalog:{kind}"
+
+
+async def _catalog_state(state, kind: str) -> dict:
+    try:
+        data = json.loads(await state.get_setting(_catalog_key(kind), "") or "{}")
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict) or not isinstance(data.get("values"), dict) \
+            or not isinstance(data.get("pending"), list):
+        data = {"values": {}, "pending": list(LETTERS)}
+    return data
+
+
+async def catalog(state, kind: str) -> dict:
+    """What Harvey has of one SalesQL list: {"values": [names], "complete": bool}."""
+    data = await _catalog_state(state, kind)
+    return {"values": sorted(data["values"], key=str.lower), "complete": not data["pending"]}
+
+
+def _lookups_today_key() -> str:
+    return f"salesql_catalog_lookups:{datetime.now(timezone.utc):%Y-%m-%d}"
+
+
+async def collect_catalogs(state, api_key: str, *, transport=None, sleep=asyncio.sleep,
+                           max_steps: int = 400) -> dict:
+    """Collect what is still missing of the three lists, inside the lookup
+    limits. Returns {"lookups": n, "complete": bool, "stopped": why}."""
+    out = {"lookups": 0, "complete": False, "stopped": ""}
+    async with sq.SalesQL(api_key, transport=transport) as client:
+        account = await client.account_status()
+        per_minute = account.get("lookups_per_minute") or 20
+        per_day = account.get("lookups_per_day") or 100
+        budget = int(per_day * CATALOG_DAY_SHARE)
+        pause = 60.0 / max(per_minute * 0.7, 1)
+        # Single letters for every list first: that already brings most names.
+        # The longer queries that fill in the busiest letters come after.
+        for kind, length in [(k, n) for n in (1, 2, 3) for k in CATALOG_KINDS]:
+            data = await _catalog_state(state, kind)
+            while any(len(x) == length for x in data["pending"]):
+                if out["lookups"] >= max_steps:
+                    out["stopped"] = "paused"
+                    return out
+                try:
+                    used = int(await state.get_setting(_lookups_today_key(), "0") or "0")
+                except ValueError:
+                    used = 0
+                if used >= budget:
+                    out["stopped"] = ("SalesQL allows your plan a set number of lookups a day. "
+                                      "The rest of the list is collected tomorrow.")
+                    return out
+                prefix = next(x for x in data["pending"] if len(x) == length)
+                await state.increment_setting(_lookups_today_key(), 1)
+                try:
+                    found = await client.lookup(kind, q=prefix, size=LOOKUP_PAGE)
+                except sq.SalesQLError as e:
+                    out["stopped"] = str(e)
+                    return out
+                out["lookups"] += 1
+                for v in found:
+                    if v["label"] and v["label"] not in data["values"]:
+                        data["values"][v["label"]] = v["value"]
+                        await state.set_setting(
+                            f"salesql:lookup:{kind}:{v['label'].lower()}", v["value"])
+                data["pending"].remove(prefix)
+                if len(found) >= LOOKUP_PAGE and len(prefix) < 3:
+                    # A full page means there are more: ask for each longer start.
+                    data["pending"] += [prefix + c for c in LETTERS]
+                await state.set_setting(_catalog_key(kind), json.dumps(data))
+                if data["pending"]:
+                    await sleep(pause)
+    out["complete"] = True
+    return out
+
+
+def catalog_fresh() -> dict:
+    return {"values": {}, "pending": list(LETTERS)}
+
+
 async def suggest(state, api_key: str, kind: str, q: str, *, transport=None) -> list[str]:
     """SalesQL's names for what was typed ("calif" -> ["California", ...]).
     Free. Each name's identifier is remembered, so a search needs no second
