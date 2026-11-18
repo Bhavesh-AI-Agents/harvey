@@ -241,6 +241,8 @@ class SalesQL:
             "credits_refresh_date": _str(data.get("credits_refresh_date"))[:10],
             "searches_per_day": _int(_dict(limits.get("search_people")).get("daily")),
             "reveals_per_day": _int(_dict(limits.get("persons/enrich")).get("daily")),
+            "lookups_per_day": _int(_dict(limits.get("lookup")).get("daily")),
+            "lookups_per_minute": _int(_dict(limits.get("lookup")).get("minute")),
         }
 
     async def lookup(self, kind: str, q: str = "", size: int = 20) -> list[dict]:

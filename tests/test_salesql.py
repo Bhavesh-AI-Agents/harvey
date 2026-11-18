@@ -620,3 +620,65 @@ async def test_saved_names_are_checked_with_salesql(state):
     assert len(notes) == 2
     assert any("no state called \"Boston\"" in n and "Cities" in n for n in notes)
     assert any("\"finance\" will be read as \"Financial Services\"" in n for n in notes)
+
+
+class ListServer(FakeSalesQL):
+    """A SalesQL whose lookup matches the start of any word, 100 names at most."""
+
+    def __init__(self, names, **kw):
+        super().__init__(**kw)
+        self.names = names
+        self.per_day = 1000
+
+    def _result(self, name, args):
+        if name == "get_account_status":
+            return {"plan": "Basic", "credits": 2000, "banned": False,
+                    "rate_limits": {"lookup": {"daily": self.per_day, "minute": 20}}}
+        if name == "lookup":
+            q = args["params"]["q"].lower()
+            hits = [n for n in self.names[args["params"]["type"]]
+                    if any(word.startswith(q) for word in n.lower().split())]
+            return {"values": [{"value": "v-" + n.lower(), "label": n} for n in hits[:100]]}
+        return super()._result(name, args)
+
+
+async def _no_sleep(_seconds):
+    return None
+
+
+@pytest.mark.asyncio
+async def test_the_whole_list_is_collected_letter_by_letter(state):
+    names = {"industry": ["Retail", "Real Estate", "Financial Services", "Accounting"]
+             + [f"S{chr(97 + i % 26)}{chr(97 + i // 26)}x Services" for i in range(150)],
+             "region": ["California", "Massachusetts", "New York (Area)"],
+             "country": ["United States", "United Kingdom"]}
+    server = ListServer(names)
+    out = await collector.collect_catalogs(state, KEY, transport=server.transport, sleep=_no_sleep)
+    assert out["complete"] and not out["stopped"]
+    got = await collector.catalog(state, "industry")
+    assert got["complete"] and set(got["values"]) == set(names["industry"])
+    assert (await collector.catalog(state, "region"))["values"] == [
+        "California", "Massachusetts", "New York (Area)"]
+    # 26 letters for each list; the full "s" split into 26, then the full "se" into 26.
+    assert out["lookups"] == 26 * 3 + 26 + 26
+    # A name picked from the list needs no second lookup at search time.
+    assert await state.get_setting("salesql:lookup:region:new york (area)", "") \
+        == "v-new york (area)"
+    again = await collector.collect_catalogs(state, KEY, transport=server.transport,
+                                             sleep=_no_sleep)
+    assert again["lookups"] == 0 and again["complete"]
+
+
+@pytest.mark.asyncio
+async def test_collecting_stops_short_of_the_days_lookups_and_resumes(state):
+    server = ListServer({"industry": ["Retail"], "region": ["California"],
+                         "country": ["United States"]})
+    server.per_day = 50
+    out = await collector.collect_catalogs(state, KEY, transport=server.transport, sleep=_no_sleep)
+    assert out["lookups"] == 30 and "tomorrow" in out["stopped"] and not out["complete"]
+    assert (await collector.catalog(state, "industry"))["values"] == ["Retail"]
+    assert (await collector.catalog(state, "region"))["complete"] is False
+    await state.set_setting(collector._lookups_today_key(), "0")       # the next day
+    server.per_day = 1000
+    out = await collector.collect_catalogs(state, KEY, transport=server.transport, sleep=_no_sleep)
+    assert out["complete"] and out["lookups"] == 26 * 3 - 30

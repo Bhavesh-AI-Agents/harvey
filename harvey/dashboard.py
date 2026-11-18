@@ -865,6 +865,50 @@ async def salesql_cap(request: Request):
     return {"success": True, "cap": cap}
 
 
+_catalog_task: asyncio.Task | None = None
+_catalog_note = ""
+_catalog_retry_at = 0.0
+
+
+async def _collect_catalogs(key: str):
+    global _catalog_note, _catalog_retry_at
+    import time as _time
+    from harvey.collectors import salesql as collector
+    from harvey.integrations import salesql as sq
+    try:
+        state = _state()
+        await state.init_db()
+        result = await collector.collect_catalogs(state, key)
+        _catalog_note = result["stopped"]
+    except sq.SalesQLError as e:
+        _catalog_note = str(e)
+    except Exception as e:
+        logger.warning("Collecting SalesQL's lists failed: %s", type(e).__name__)
+        _catalog_note = "Couldn't collect SalesQL's lists."
+    # After a stop (a limit, an error), don't try again for ten minutes.
+    _catalog_retry_at = _time.monotonic() + 600 if _catalog_note else 0.0
+
+
+@app.get("/api/salesql/catalog")
+async def salesql_catalog():
+    """SalesQL's industries, regions and countries, as far as collected.
+    Starts collecting what is missing in the background."""
+    global _catalog_task
+    import time as _time
+    from harvey.collectors import salesql as collector
+    state = _state()
+    await state.init_db()
+    lists = {kind: await collector.catalog(state, kind) for kind in collector.CATALOG_KINDS}
+    complete = all(v["complete"] for v in lists.values())
+    running = _catalog_task is not None and not _catalog_task.done()
+    key = _salesql_key()
+    if key and not complete and not running and _time.monotonic() >= _catalog_retry_at:
+        _catalog_task = asyncio.create_task(_collect_catalogs(key))
+        running = True
+    return {"lists": lists, "complete": complete, "collecting": running,
+            "note": "" if running or complete else _catalog_note}
+
+
 @app.post("/api/salesql/lookup")
 async def salesql_lookup(request: Request):
     """The names SalesQL has for what was typed: countries, states or industries. Free."""

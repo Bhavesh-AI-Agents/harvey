@@ -1153,6 +1153,7 @@ async function loadSalesql() {
   if (!rows.length) {
     el.innerHTML = head + emptyState('&#128269;', 'Nobody found yet',
       'Set <b>Who to search for</b>, then press <b>Search</b>. It spends no credits.');
+    if (_salesqlSettingsOpen && !_sqCatalog) loadSalesqlCatalog();
     return;
   }
   const tone = {qualified: 't-good', unsure: 't-waiting', rejected: 't-bad'};
@@ -1169,6 +1170,7 @@ async function loadSalesql() {
       '</span></td><td>' + escHtml(r.reason || '') + '</td></tr>').join('') +
     '</tbody></table></div>';
   el.innerHTML = head;
+  if (_salesqlSettingsOpen && !_sqCatalog) loadSalesqlCatalog();
   countSalesqlPicks();
 }
 
@@ -1181,10 +1183,66 @@ const SALESQL_LISTS = [
 ];
 // Picked from SalesQL's own lists, so a name can't be mistyped.
 const SALESQL_PICKS = [
-  ['countries', 'country', 'Countries', 'Type to search, e.g. United'],
-  ['states', 'region', 'States', 'Type to search, e.g. Calif (empty: the whole country)'],
-  ['industries', 'industry', 'Industries', 'Type to search, e.g. retail (empty: any industry)'],
+  ['countries', 'country', 'Countries', 'Type to narrow the list'],
+  ['states', 'region', 'States and regions', 'Type to narrow the list (none ticked: the whole country)'],
+  ['industries', 'industry', 'Industries', 'Type to narrow the list (none ticked: any industry)'],
 ];
+let _sqCatalog = null;   // {lists: {kind: {values, complete}}, collecting, note}
+let _sqShown = {};       // field -> names currently listed
+let _sqCatalogTimer = null;
+
+async function loadSalesqlCatalog() {
+  clearTimeout(_sqCatalogTimer);
+  const data = await api('/api/salesql/catalog');
+  if (!data) return;
+  _sqCatalog = data;
+  SALESQL_PICKS.forEach(([field, kind]) => {
+    const el = document.getElementById('sq-list-' + field);
+    if (el) el.innerHTML = salesqlOptions(field, kind);
+  });
+  const open = document.getElementById('salesql-settings');
+  if (data.collecting && open && open.open) _sqCatalogTimer = setTimeout(loadSalesqlCatalog, 6000);
+}
+
+function salesqlOptions(field, kind) {
+  const list = _sqCatalog && _sqCatalog.lists ? _sqCatalog.lists[kind] : null;
+  if (!list) return '<span class="muted">Loading SalesQL\'s list…</span>';
+  const input = document.getElementById('sq-find-' + field);
+  const q = input ? input.value.trim().toLowerCase() : '';
+  const picked = _sqPicked[field] || [];
+  const names = list.values.filter(n => !q || n.toLowerCase().includes(q));
+  _sqShown[field] = names.slice(0, 400);
+  let html = _sqShown[field].map((name, i) => '<label style="display:block;margin:2px 0">' +
+    '<input type="checkbox"' + (picked.includes(name) ? ' checked' : '') +
+    ' onchange="toggleSalesqlPick(\'' + field + '\',' + i + ',this.checked)"> ' + escHtml(name) + '</label>').join('');
+  if (!names.length) html = '<span class="muted">' + (q ? 'Nothing in the list matches that.' : 'The list is empty so far.') + '</span>';
+  let status = list.values.length + ' from SalesQL';
+  if (!list.complete) {
+    status += _sqCatalog.collecting ? ' so far; still collecting the rest'
+      : '; the list is not complete yet' + (_sqCatalog.note ? ' (' + _sqCatalog.note + ')' : '');
+  }
+  return html + '<p class="desc" style="margin:6px 0 0">' + escHtml(status) + '.</p>';
+}
+
+function toggleSalesqlPick(field, i, on) {
+  const name = (_sqShown[field] || [])[i];
+  if (!name) return;
+  const picked = _sqPicked[field] = _sqPicked[field] || [];
+  const at = picked.indexOf(name);
+  if (on && at < 0) picked.push(name);
+  if (!on && at >= 0) picked.splice(at, 1);
+  const chips = document.getElementById('sq-chips-' + field);
+  if (chips) chips.innerHTML = salesqlChips(field);
+}
+
+function filterSalesql(field, kind) {
+  const el = document.getElementById('sq-list-' + field);
+  if (el) el.innerHTML = salesqlOptions(field, kind);
+  // Not in the collected list (it may still be filling): ask SalesQL directly.
+  const offer = document.getElementById('sq-offer-' + field);
+  if ((_sqShown[field] || []).length) { if (offer) offer.innerHTML = ''; clearTimeout(_sqTimer); return; }
+  suggestSalesql(field, kind);
+}
 let _sqPicked = {};      // field -> names chosen
 let _sqOffered = {};     // field -> names SalesQL offered for what was typed
 let _sqTimer = null;
@@ -1201,6 +1259,9 @@ function dropSalesqlPick(field, i) {
   (_sqPicked[field] || []).splice(i, 1);
   const el = document.getElementById('sq-chips-' + field);
   if (el) el.innerHTML = salesqlChips(field);
+  const pick = SALESQL_PICKS.find(x => x[0] === field);
+  const list = document.getElementById('sq-list-' + field);
+  if (pick && list) list.innerHTML = salesqlOptions(field, pick[1]);
 }
 
 function addSalesqlPick(field, i) {
@@ -1242,7 +1303,7 @@ function salesqlSettingsForm(search, sizes) {
   if (!search) return '';
   const open = _salesqlSettingsOpen ? ' open' : '';
   let html = '<details id="salesql-settings" style="margin-top:14px"' + open +
-    ' ontoggle="_salesqlSettingsOpen = this.open"><summary style="cursor:pointer"><b>Who to search for</b> ' +
+    ' ontoggle="_salesqlSettingsOpen = this.open; if (this.open) loadSalesqlCatalog()"><summary style="cursor:pointer"><b>Who to search for</b> ' +
     '<span class="muted">' + escHtml((search.job_titles || []).slice(0, 3).join(', ')) +
     ' &middot; ' + escHtml((search.company_sizes || []).join(', ') || 'any size') + ' employees &middot; ' +
     escHtml((search.states || []).concat(search.states && search.states.length ? [] : search.countries || [])
@@ -1256,7 +1317,9 @@ function salesqlSettingsForm(search, sizes) {
     return '<div class="form-group"><label class="form-label" for="sq-find-' + field + '">' + label +
       '</label><div id="sq-chips-' + field + '" style="margin-bottom:6px">' + salesqlChips(field) + '</div>' +
       '<input class="form-input" id="sq-find-' + field + '" type="text" autocomplete="off" placeholder="' +
-      escHtml(hint) + '" oninput="suggestSalesql(\'' + field + '\',\'' + kind + '\')">' +
+      escHtml(hint) + '" oninput="filterSalesql(\'' + field + '\',\'' + kind + '\')">' +
+      '<div id="sq-list-' + field + '" style="max-height:190px;overflow:auto;border:1px solid var(--line);' +
+      'border-radius:8px;padding:8px 10px;margin-top:6px">' + salesqlOptions(field, kind) + '</div>' +
       '<div id="sq-offer-' + field + '"></div></div>';
   };
   ['job_titles', 'countries', 'states', 'cities', 'industries', 'company_keywords'].forEach(field => {
