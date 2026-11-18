@@ -85,6 +85,9 @@ class FakeSalesQL:
                 raise PermissionError
             return {"email": params["email"], "status": self.verify_status}
         if name == "lookup":
+            if params["type"] == "company_type":
+                return {"values": [{"value": "t-private", "label": "Privately Held"},
+                                   {"value": "t-public", "label": "Public Company"}]}
             if params["type"] == "country":
                 return {"values": [{"value": US, "label": "United States"}]
                         if params.get("q") == "United States" else []}
@@ -611,15 +614,18 @@ async def test_unknown_industries_stop_the_search(state):
 
 
 @pytest.mark.asyncio
-async def test_saved_names_are_checked_with_salesql(state):
+async def test_names_in_an_audience_are_checked_with_salesql(state):
     fake = FakeSalesQL()
-    config = make_config()
-    await collector.set_search_settings(state, config, {
-        "states": ["California", "Boston"], "countries": ["US"], "industries": ["finance"]})
-    notes = await collector.check_names(state, config, KEY, transport=fake.transport)
-    assert len(notes) == 2
-    assert any("no state called \"Boston\"" in n and "Cities" in n for n in notes)
-    assert any("\"finance\" will be read as \"Financial Services\"" in n for n in notes)
+    aud = audience(states={"include": ["California"], "exclude": ["Boston"]},
+                   countries={"include": ["US"], "exclude": []})
+    notes = await collector.check_names(state, collector.clean_audience(aud), KEY,
+                                        transport=fake.transport)
+    assert len(notes) == 1 and "no state called \"Boston\"" in notes[0] and "City" in notes[0]
+    again = FakeSalesQL()
+    await collector.check_names(state, collector.clean_audience(
+        audience(states={"include": ["California"], "exclude": []})), KEY, transport=again.transport)
+    assert not again.tools("lookup")            # already known: no second lookup
+
 
 
 class ListServer(FakeSalesQL):
@@ -635,7 +641,10 @@ class ListServer(FakeSalesQL):
             return {"plan": "Basic", "credits": 2000, "banned": False,
                     "rate_limits": {"lookup": {"daily": self.per_day, "minute": 20}}}
         if name == "lookup":
-            q = args["params"]["q"].lower()
+            q = args["params"].get("q", "").lower()
+            if args["params"]["type"] == "company_type":
+                return {"values": [{"value": "t-private", "label": "Privately Held"},
+                                   {"value": "t-public", "label": "Public Company"}]}
             hits = [n for n in self.names[args["params"]["type"]]
                     if any(word.startswith(q) for word in n.lower().split())]
             return {"values": [{"value": "v-" + n.lower(), "label": n} for n in hits[:100]]}
@@ -660,7 +669,9 @@ async def test_the_whole_list_is_collected_letter_by_letter(state):
     assert (await collector.catalog(state, "region"))["values"] == [
         "California", "Massachusetts", "New York (Area)"]
     # 26 letters for each list; the full "s" split into 26, then the full "se" into 26.
-    assert out["lookups"] == 26 * 3 + 26 + 26
+    assert out["lookups"] == 1 + 26 * 3 + 26 + 26
+    assert (await collector.catalog(state, "company_type"))["values"] == [
+        "Privately Held", "Public Company"]
     # A name picked from the list needs no second lookup at search time.
     assert await state.get_setting("salesql:lookup:region:new york (area)", "") \
         == "v-new york (area)"
@@ -681,7 +692,7 @@ async def test_collecting_stops_short_of_the_days_lookups_and_resumes(state):
     await state.set_setting(collector._lookups_today_key(), "0")       # the next day
     server.per_day = 1000
     out = await collector.collect_catalogs(state, KEY, transport=server.transport, sleep=_no_sleep)
-    assert out["complete"] and out["lookups"] == 26 * 3 - 30
+    assert out["complete"] and out["lookups"] == 1 + 26 * 3 - 30
 
 
 # ── rules ──
@@ -758,3 +769,105 @@ def test_every_filter_has_a_label_and_reads_as_a_sentence():
         value = True if how == "flag" else 5 if how in ("gte", "lte") else ["Intern"]
         rule = collector.clean_rules([{"kind": "filter", "filter": name, "value": value}])[0]
         assert collector.describe_rule(rule).endswith(".")
+
+
+# ── audiences ──
+
+def audience(**changes):
+    base = {"name": "Owners", "company_sizes": ["1-10"], "page_size": 100, "staff": []}
+    for field in collector.PAIR_FIELDS:
+        base[field] = {"include": [], "exclude": []}
+    base["job_titles"]["include"] = ["Owner", "Founder"]
+    base.update(changes)
+    return base
+
+
+@pytest.mark.asyncio
+async def test_before_any_audience_is_saved_the_form_shows_what_is_in_force(state):
+    shown = await collector.list_audiences(state, make_config())
+    assert shown["saved"] is False and shown["items"] == []
+    aud = shown["audience"]
+    assert aud["job_titles"]["include"] == ["Founder", "Owner"]
+    assert "engineer" in aud["profile_words"]["exclude"]
+    assert aud["past_titles"]["exclude"] and aud["staff"][0]["label"] == "software"
+    assert collector.clean_audience(aud)            # it can be saved as it stands
+
+
+@pytest.mark.asyncio
+async def test_an_audience_sends_includes_and_excludes_to_salesql(state):
+    aud = audience(
+        job_titles={"include": ["Owner"], "exclude": ["Assistant"]},
+        past_titles={"include": [], "exclude": ["Developer"]},
+        countries={"include": ["United States"], "exclude": []},
+        states={"include": ["California"], "exclude": []},
+        industries={"include": [], "exclude": ["Financial Services"]},
+        company_types={"include": ["Privately Held"], "exclude": []},
+        has_phone=True, founded={"min": 2015, "max": None},
+        experience={"min": 5, "max": 30})
+    await collector.save_audience(state, aud)
+    fake = FakeSalesQL()
+    await collector.search(state, make_config(), KEY, transport=fake.transport)
+    sent = fake.tools("search_people")[0]["params"]
+    assert sent["job_titles"] == {"include": ["Owner"], "exclude": ["Assistant"]}
+    assert sent["past_job_titles"] == {"exclude": ["Developer"]}
+    assert sent["organization_industries"] == {"exclude": ["financial-services"]}
+    assert sent["organization_company_types"] == {"include": ["t-private"]}
+    assert sent["states_or_cities"] == ["r-ca"] and sent["countries"] == [US]
+    assert sent["has_phones"] is True and sent["page_size"] == 100
+    assert sent["organization_founded_years"] == {"gte": 2015}
+    assert sent["years_experience_total"] == {"gte": 5, "lte": 30}
+    assert sent["organization_employee_ranges"] == ["1-10"]
+    assert len(fake.tools("search_people")) == 1        # no staff check asked for
+
+
+@pytest.mark.asyncio
+async def test_local_excludes_and_staff_checks_grade_people(state):
+    aud = audience(
+        company_keywords={"include": [], "exclude": ["Lakeside"]},
+        profile_words={"include": [], "exclude": ["cto"]},
+        cities={"include": [], "exclude": ["Nowhere"]},
+        staff=[{"label": "software", "must": "none", "titles": ["Developer"]},
+               {"label": "sales", "must": "some", "titles": ["Sales Manager"]}])
+    await collector.save_audience(state, aud)
+    fake = FakeSalesQL(developers=[])
+    await collector.search(state, make_config(), KEY, transport=fake.transport)
+    rows = {r["id"]: r for r in await state.get_salesql_candidates()}
+    assert "company name" in rows["p-ben"]["reason"] and rows["p-ben"]["grade"] == "rejected"
+    assert rows["p-cal"]["grade"] == "rejected" and "cto" in rows["p-cal"]["reason"]
+    assert rows["p-ada"]["grade"] == "rejected" and "sales" in rows["p-ada"]["reason"]
+    assert len(fake.tools("search_people")) == 3        # the search and two staff checks
+
+
+@pytest.mark.asyncio
+async def test_audiences_are_kept_switched_and_deleted(state):
+    config = make_config()
+    first = await collector.save_audience(state, audience(name="California owners"))
+    second = await collector.save_audience(state, audience(
+        name="Boston founders", cities={"include": ["Boston"], "exclude": []}))
+    shown = await collector.list_audiences(state, config)
+    assert shown["active"] == second and [i["name"] for i in shown["items"]] == [
+        "California owners", "Boston founders"]
+    await collector.save_audience(state, audience(name="California owners", page_size=50), first)
+    shown = await collector.list_audiences(state, config)
+    assert shown["active"] == first and shown["audience"]["page_size"] == 50
+    with pytest.raises(ValueError, match="already called"):
+        await collector.save_audience(state, audience(name="boston founders"), first)
+    await collector.select_audience(state, second)
+    await collector.delete_audience(state, second)
+    shown = await collector.list_audiences(state, config)
+    assert shown["active"] == first and len(shown["items"]) == 1
+    with pytest.raises(ValueError):
+        await collector.select_audience(state, second)
+
+
+@pytest.mark.parametrize("change", [
+    {"job_titles": {"include": [], "exclude": []}},
+    {"job_titles": {"include": ["Owner"], "exclude": ["owner"]}},
+    {"company_sizes": ["2-9"]}, {"page_size": 5},
+    {"staff": [{"label": "x", "must": "maybe", "titles": ["a"]}]},
+    {"staff": [{"label": "x", "must": "none", "titles": []}]},
+    {"founded": {"min": 2020, "max": 2010}}, {"experience": {"min": "lots"}},
+    {"industries": {"include": "Retail"}}])
+def test_audiences_that_make_no_sense_are_refused(change):
+    with pytest.raises(ValueError):
+        collector.clean_audience(audience(**change))

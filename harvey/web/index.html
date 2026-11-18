@@ -173,10 +173,15 @@
   <div class="section-head">
     <div>
       <h2>Discover</h2>
-      <p>Find businesses matching your ICP. Pick a source, see what it will cost,
-         then run it &mdash; nothing is called until you press the button.</p>
+      <p>Find businesses that match your ICP, or people by job title through SalesQL.
+         Nothing is called, and nothing is spent, until you press a button.</p>
     </div>
   </div>
+  <div class="seg" role="tablist" aria-label="What to look for">
+    <button class="seg-btn" id="disc-seg-biz" role="tab" onclick="showDiscover('biz')">Businesses</button>
+    <button class="seg-btn" id="disc-seg-people" role="tab" onclick="showDiscover('people')">People <span class="muted">· SalesQL</span></button>
+  </div>
+  <div id="discover-biz">
   <div id="discover-profile"></div>
 
   <div class="subhead">Source</div>
@@ -222,9 +227,10 @@
     </div>
   </div>
   <div id="discover-result"></div>
-
-  <div class="subhead">People, through SalesQL</div>
-  <div id="salesql-card"></div>
+  </div>
+  <div id="discover-people" hidden>
+    <div id="salesql-root"></div>
+  </div>
 </div>
 
 <!-- Companies -->
@@ -568,5 +574,6 @@
 </div>
 
 <script src="/static/app.js"></script>
+<script src="/static/salesql.js"></script>
 </body>
 </html>

@@ -97,23 +97,6 @@ def test_the_daily_cap_can_be_changed_here(client):
     assert client.get("/api/salesql").json()["cap"] == 60
 
 
-def test_search_settings_are_shown_and_saved_from_the_card(client):
-    shown = client.get("/api/salesql").json()
-    assert shown["search"]["job_titles"] and "1-10" in shown["sizes"]
-    r = client.post("/api/salesql/settings", json={
-        "job_titles": ["Owner"], "states": ["California"], "company_sizes": ["1-10"],
-        "page_size": 100, "require_no_developers": True})
-    assert r.status_code == 200 and r.json()["search"]["states"] == ["California"]
-    again = client.get("/api/salesql").json()["search"]
-    assert again["job_titles"] == ["Owner"] and again["page_size"] == 100
-
-
-def test_bad_search_settings_are_refused_with_a_reason(client):
-    r = client.post("/api/salesql/settings", json={"company_sizes": ["tiny"]})
-    assert r.status_code == 400 and "Company sizes" in r.json()["message"]
-    assert client.post("/api/salesql/settings", json={"job_titles": []}).status_code == 400
-
-
 def test_typing_offers_salesqls_own_names(client, monkeypatch):
     monkeypatch.setenv("SALESQL_API_KEY", "sq_abc")
 
@@ -163,17 +146,45 @@ def test_the_lists_are_served_and_collecting_starts_once_connected(client, monke
     assert after["collecting"] is False and "tomorrow" in after["note"]
 
 
-def test_rules_are_shown_saved_and_checked(client):
-    shown = client.get("/api/salesql").json()
-    assert shown["rules"] and all(r["text"] for r in shown["rules"])
-    assert "title" in shown["rule_options"]["where"]
-    assert shown["rule_options"]["filters"]["has_phone"]["takes"] == "flag"
-    r = client.post("/api/salesql/rules", json={"rules": [
-        {"kind": "company_staff", "mode": "none", "label": "marketing",
-         "titles": ["Marketing Manager"]}]})
-    assert r.status_code == 200 and "marketing job title" in r.json()["rules"][0]["text"]
-    again = client.get("/api/salesql").json()["rules"]
-    assert len(again) == 1 and again[0]["id"].startswith("rule-")
-    assert client.post("/api/salesql/rules", json={"rules": []}).json()["rules"] == []
-    bad = client.post("/api/salesql/rules", json={"rules": [{"kind": "filter", "filter": "x"}]})
-    assert bad.status_code == 400 and "search filter" in bad.json()["message"]
+AUDIENCE = {"name": "California owners", "company_sizes": ["1-10"], "page_size": 100, "staff": [],
+            "job_titles": {"include": ["Owner"], "exclude": ["Assistant"]},
+            "states": {"include": ["California"], "exclude": []}}
+
+
+def test_the_form_starts_from_what_is_in_force_then_audiences_are_saved(client):
+    start = client.get("/api/salesql").json()["audiences"]
+    assert start["saved"] is False and start["audience"]["job_titles"]["include"]
+    r = client.post("/api/salesql/audience", json={"audience": AUDIENCE})
+    assert r.status_code == 200
+    first = r.json()["audiences"]["active"]
+    second = client.post("/api/salesql/audience", json={
+        "audience": {**AUDIENCE, "name": "Boston owners"}}).json()["audiences"]["active"]
+    shown = client.get("/api/salesql").json()["audiences"]
+    assert shown["saved"] and shown["active"] == second and len(shown["items"]) == 2
+    client.post("/api/salesql/audience", json={"id": first,
+                                               "audience": {**AUDIENCE, "page_size": 40}})
+    shown = client.get("/api/salesql").json()["audiences"]
+    assert shown["active"] == first and shown["audience"]["page_size"] == 40
+    assert client.post("/api/salesql/audience/select", json={"id": second}).json()["success"]
+    assert client.post("/api/salesql/audience/delete", json={"id": second}).json()["success"]
+    assert client.get("/api/salesql").json()["audiences"]["active"] == first
+    assert client.post("/api/salesql/audience/select", json={"id": second}).status_code == 400
+
+
+def test_a_bad_audience_is_refused_with_a_reason(client):
+    r = client.post("/api/salesql/audience", json={"audience": {**AUDIENCE, "company_sizes": ["tiny"]}})
+    assert r.status_code == 400 and "Company sizes" in r.json()["message"]
+    r = client.post("/api/salesql/audience", json={"audience": {
+        **AUDIENCE, "job_titles": {"include": ["Owner"], "exclude": ["owner"]}}})
+    assert r.status_code == 400 and "both included and excluded" in r.json()["message"]
+
+
+def test_people_can_be_taken_off_the_list_for_free(client, env):
+    import sqlite3
+    with sqlite3.connect(env["db"]) as db:
+        db.execute("INSERT INTO salesql_candidates (id, full_name, status, grade) "
+                   "VALUES ('p-1', 'Ada Example', 'found', 'rejected')")
+    assert len(client.get("/api/salesql").json()["candidates"]) == 1
+    r = client.post("/api/salesql/dismiss", json={"ids": ["p-1", "p-missing"]}).json()
+    assert r["dismissed"] == 1 and client.get("/api/salesql").json()["candidates"] == []
+    assert client.post("/api/salesql/dismiss", json={"ids": []}).status_code == 400
