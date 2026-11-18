@@ -347,6 +347,33 @@ def pick_email(person: dict, org_domain: str) -> tuple[str, bool]:
     return best
 
 
+def pick_phone(person: dict) -> tuple[str, bool]:
+    """(number, salesql_verified) of the best phone number in a revealed
+    profile, or ("", False). A reveal already returns the numbers SalesQL
+    holds, at no extra credit. A number SalesQL marks valid wins, then a
+    direct or mobile one over a company switchboard."""
+    best, best_rank = ("", False), -1
+    for entry in person.get("phones") or []:
+        if isinstance(entry, str):
+            entry = {"phone": entry}
+        if not isinstance(entry, dict):
+            continue
+        number = next((_s(entry.get(k)) for k in ("phone", "number", "phone_number", "value")
+                       if _s(entry.get(k))), "")
+        digits = re.sub(r"\D", "", number)
+        if not 7 <= len(digits) <= 15 or "*" in number or "..." in number:
+            continue
+        number = re.sub(r"[^0-9+() .x-]", "", number).strip()[:32]
+        verified = entry.get("is_valid") is True or entry.get("verified") is True \
+            or _s(entry.get("status")).lower() == "valid"
+        kind = _s(entry.get("type")).lower()
+        direct = any(word in kind for word in ("mobile", "direct", "cell", "personal"))
+        rank = (2 if verified else 0) + (1 if direct else 0)
+        if rank > best_rank:
+            best, best_rank = (number, verified), rank
+    return best
+
+
 def split_name(full_name: str) -> tuple[str, str]:
     """First and last name, dropping post-nominals after a comma ("Sam Lee, MBA")."""
     name = re.sub(r"\s+", " ", _s(full_name).split(",")[0])
@@ -430,9 +457,12 @@ async def reveal(state, config, api_key: str, candidate_ids: list[str], *,
             summary["failed"] += 1
             continue
         email, sq_verified = pick_email(person, row["org_domain"])
+        phone, phone_verified = pick_phone(person)
         if not email:
             await state.update_salesql_candidate(
-                row["id"], status="no_email", note="No work email in the SalesQL profile.")
+                row["id"], status="no_email",
+                note="No work email in the SalesQL profile."
+                     + (f" Phone: {phone}" if phone else ""))
             summary["no_email"] += 1
             continue
         if do_not_contact_match(email, blocked):
@@ -461,6 +491,7 @@ async def reveal(state, config, api_key: str, candidate_ids: list[str], *,
         prospect_id = await state.add_prospect(Prospect(
             company_id=company_id, first_name=first, last_name=last, email=email,
             email_verified=status == "verified", email_status=status,
+            phone=phone, phone_verified=phone_verified,
             linkedin_url=row["linkedin_url"], title=_s(person.get("title")) or row["title"],
             source=COLLECTOR, source_url=row["linkedin_url"], score=70,
             personalization_notes="\n".join(notes), company=row["org_name"],

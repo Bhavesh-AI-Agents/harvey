@@ -106,7 +106,9 @@ class FakeSalesQL:
                             "emails": [
                                 {"email": f"{uuid}@gmail.example", "type": "PE", "verified": True},
                                 {"email": f"{uuid}@other.example", "type": "BE", "verified": True},
-                                {"email": f"{uuid}@{domain}", "type": "BE", "verified": True}]})
+                                {"email": f"{uuid}@{domain}", "type": "BE", "verified": True}],
+                            "phones": [{"phone": "+1 555 0100", "type": "Company"},
+                                       {"phone": "+1 555 0142", "type": "Mobile", "is_valid": True}]})
             return {"results": out}
         raise AssertionError(name)
 
@@ -314,6 +316,7 @@ async def test_revealing_makes_a_prospect_with_the_company_address(state):
     prospect = await state.get_prospect_by_email("p-ada@northvale.example")
     assert prospect.first_name == "Ada" and prospect.last_name == "Example"
     assert prospect.email_status == "verified" and prospect.status == "new"
+    assert prospect.phone == "+1 555 0142" and prospect.phone_verified is True
     assert prospect.source == "salesql" and "No software job titles" in prospect.personalization_notes
     company = await state.get_company(prospect.company_id)
     assert company.domain == "northvale.example" and company.external_id == "salesql:o-1"
@@ -441,3 +444,15 @@ async def test_the_cap_set_on_the_dashboard_wins_over_the_file(state):
     out = await collector.reveal(state, config, KEY, ["p-ada"], verify=verified,
                                  transport=fake.transport)
     assert out["held_back"] == 1 and not fake.tools("enrich_person_bulk")
+
+
+def test_the_phone_kept_is_a_real_valid_direct_number():
+    pick = collector.pick_phone
+    assert pick({}) == ("", False) and pick({"phones": "x"}) == ("", False)
+    assert pick({"phones": ["+1 (555) 0100"]}) == ("+1 (555) 0100", False)
+    assert pick({"phones": [{"phone": "+1 555 ***"}, {"number": "12"}]}) == ("", False)
+    assert pick({"phones": [{"phone": "+1 555 0100", "type": "Mobile"},
+                            {"phone": "+1 555 0199", "type": "Company", "is_valid": True}]}) \
+        == ("+1 555 0199", True)
+    assert pick({"phones": [{"phone": "+1 555 0100", "type": "Company"},
+                            {"number": "+1 555 0142", "type": "Direct"}]}) == ("+1 555 0142", False)

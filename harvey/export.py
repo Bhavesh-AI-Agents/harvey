@@ -21,6 +21,7 @@ CSV_COLUMNS = [
     "email", "first_name", "last_name", "company_name", "title",
     "website", "linkedin_url", "industry", "personalization",
     "email_status", "score", "seniority", "source", "status", "created_at",
+    "phone",
 ]
 
 DEFAULT_EMAIL_STATUSES = ["verified", "risky"]
@@ -96,6 +97,7 @@ async def collect_prospects(
             "source": r.get("source", ""),
             "status": r.get("status", ""),
             "created_at": r.get("created_at", ""),
+            "phone": r.get("phone", ""),
         })
     return out
 
