@@ -819,7 +819,7 @@ async def salesql_overview():
     # the people found before audiences were used (and empty after that).
     shown = out.get("audiences") or {}
     scope = shown.get("active") or ""
-    if not shown.get("saved") and await state.get_setting(collector.USED_KEY, ""):
+    if not shown.get("saved") and await collector.audiences_used(state):
         await state.delete_salesql_candidates("", "found")      # left over from deleted audiences
     out["candidates"] = [_salesql_row(r) for r in await state.get_salesql_candidates(
         status="found", audience_id=scope)]

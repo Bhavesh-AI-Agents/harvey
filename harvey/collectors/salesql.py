@@ -556,6 +556,14 @@ def audience_to_engine(aud: dict) -> tuple[dict, list[dict]]:
     return settings, clean_rules(rules)
 
 
+async def audiences_used(state) -> bool:
+    """Whether an audience has ever been saved here. True also for installs
+    that saved one before this was recorded: the stored audiences entry
+    exists once any has been saved, even after all were deleted."""
+    return bool(await state.get_setting(USED_KEY, "")) \
+        or bool(await state.get_setting(AUDIENCES_KEY, ""))
+
+
 def blank_audience() -> dict:
     """An audience with nothing chosen yet."""
     aud: dict = {"name": "New audience", "company_sizes": [], "page_size": 100, "staff": []}
@@ -819,7 +827,7 @@ async def list_audiences(state, config) -> dict:
         # Before audiences were ever used, the form starts from harvey.yaml.
         # After the last one is deleted it starts empty: the operator cleared
         # it, and the file's values are not what they were working with.
-        used = bool(await state.get_setting(USED_KEY, ""))
+        used = await audiences_used(state)
         return {"active": "", "items": [], "saved": False,
                 "audience": blank_audience() if used
                 else await audience_from_legacy(state, config)}
@@ -840,13 +848,14 @@ async def save_audience(state, audience, audience_id: str = "") -> str:
     taken = {v["name"].lower() for k, v in data["items"].items() if k != audience_id}
     if clean["name"].lower() in taken:
         raise ValueError(f"Another audience is already called \"{clean['name']}\".")
+    first_ever = not await audiences_used(state)
     data["items"][audience_id] = clean
     data["active"] = audience_id
     await state.set_setting(AUDIENCES_KEY, json.dumps(data))
-    if not await state.get_setting(USED_KEY, ""):
+    await state.set_setting(USED_KEY, "1")
+    if first_ever:
         # People found before audiences existed belong to the first one ever saved.
         await state.adopt_salesql_candidates(audience_id)
-        await state.set_setting(USED_KEY, "1")
     return audience_id
 
 

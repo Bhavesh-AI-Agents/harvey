@@ -228,3 +228,20 @@ def test_the_people_shown_belong_to_the_audience_in_use(client, env):
     assert client.get("/api/salesql").json()["candidates"] == []
     client.post("/api/salesql/audience/select", json={"id": first})
     assert [r["id"] for r in client.get("/api/salesql").json()["candidates"]] == ["p-1"]
+
+
+def test_an_install_that_deleted_its_audiences_before_this_was_recorded_starts_clean(client, env):
+    """Seen on a real install: audiences saved and deleted by an earlier
+    version left their people behind and the placeholder filters showing."""
+    import sqlite3
+    with sqlite3.connect(env["db"]) as db:
+        db.execute("INSERT INTO settings (key, value) VALUES ('salesql:audiences', ?)",
+                   ('{"active": "", "items": {}}',))
+        db.execute("INSERT INTO salesql_candidates (id, full_name, status, grade) "
+                   "VALUES ('p-1', 'Ada Example', 'found', 'qualified'), "
+                   "('p-2', 'Ben Example', 'revealed', 'qualified')")
+    data = client.get("/api/salesql").json()
+    assert data["candidates"] == [] and data["audiences"]["saved"] is False
+    assert data["audiences"]["audience"]["job_titles"]["include"] == []
+    with sqlite3.connect(env["db"]) as db:
+        assert [r[0] for r in db.execute("SELECT id FROM salesql_candidates")] == ["p-2"]
