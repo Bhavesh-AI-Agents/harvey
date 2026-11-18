@@ -19,6 +19,7 @@ Nothing here opens or scrapes linkedin.com. A LinkedIn URL is only an
 identifier SalesQL returns and accepts.
 """
 
+import asyncio
 import logging
 import re
 from datetime import datetime, timezone
@@ -150,7 +151,10 @@ async def _lookup(client, state, kind: str, name: str) -> str:
         return "" if cached == "-" else cached
     values = await client.lookup(kind, q=name, size=10)
     exact = [v for v in values if v["label"].lower() == name.lower()]
-    # A country must match by name. An industry may take SalesQL's closest.
+    if not exact and kind == "region":
+        # A state is often listed with its country: "California, United States".
+        exact = [v for v in values if v["label"].lower().split(",")[0].strip() == name.lower()]
+    # A country or state must match by name. An industry may take SalesQL's closest.
     chosen = exact[0] if exact else (values[0] if values and kind == "industry" else None)
     await state.set_setting(key, chosen["value"] if chosen else "-")
     return chosen["value"] if chosen else ""
@@ -188,6 +192,20 @@ async def build_filters(client, state, config) -> tuple[dict, list[str]]:
         filters["organization_countries"] = countries
         filters["countries"] = countries
 
+    states = []
+    for name in cfg.states:
+        value = await _lookup(client, state, "region", name)
+        if value and value not in states:
+            states.append(value)
+        elif not value:
+            notes.append(f"SalesQL has no state or city called \"{_s(name)}\".")
+    if cfg.states and not states:
+        raise sq.SalesQLError("SalesQL recognised none of salesql.states, so the search "
+                              "would have covered the whole country. Check the names.")
+    if states:
+        filters["organization_states_or_cities"] = states
+        filters["states_or_cities"] = states
+
     filters["has_work_emails"] = True
 
     if cfg.company_keywords:
@@ -196,6 +214,8 @@ async def build_filters(client, state, config) -> tuple[dict, list[str]]:
             org_filters["employee_ranges"] = sizes
         if countries:
             org_filters["countries"] = countries
+        if states:
+            org_filters["states_or_cities"] = states
         uuids: list[str] = []
         for keyword in org_filters["name"][:MAX_KEYWORD_SEARCHES]:
             found = await client.search_organizations({**org_filters, "name": [keyword]},
@@ -464,11 +484,48 @@ async def reveal(state, config, api_key: str, candidate_ids: list[str], *,
     return summary
 
 
+CHECKS_AT_ONCE = 5         # address checks running side by side
+
+
+async def _salesql_checks(checker, emails: list[str], summary: dict) -> dict[str, str]:
+    """SalesQL's verdict on each address: {email: valid|invalid|catch_all|unknown}.
+
+    A few run side by side, since one check can take most of a minute. The
+    first refusal stops the checks not yet started: a key without the Verify
+    scope or a spent balance fails every time, and a failed call may still
+    have been charged. An address with no entry was not checked.
+    """
+    answers: dict[str, str] = {}
+    emails = list(dict.fromkeys(emails))
+    if not emails:
+        return answers
+    gate = asyncio.Semaphore(CHECKS_AT_ONCE)
+    stopped: list[str] = []
+
+    async def one(email):
+        async with gate:
+            if stopped:
+                return
+            try:
+                answers[email] = await checker.verify_email(email)
+            except sq.SalesQLError as e:
+                stopped.append(str(e))
+
+    await checker.account_status()      # open the session once, before the checks share it
+    await asyncio.gather(*(one(e) for e in emails))
+    summary["verifications_used"] += len(answers)
+    if stopped:
+        summary["messages"].append(
+            f"SalesQL couldn't check {len(emails) - len(answers)} of {len(emails)} addresses "
+            f"({stopped[0]}) If the key lacks the Verify scope, tick it on the key in SalesQL.")
+    return answers
+
+
 async def _file_people(state, config, rows, people, summary, blocked, confirmed,
                        verify, env, checker):
     """Turn each revealed profile into a prospect with a checked address."""
     from harvey.gate import do_not_contact_match
-    salesql_checks = config.salesql.verify_emails
+    ready = []      # [row, person, email, sq_verified, phone, phone_verified, status]
     for row, person in zip(rows, people):
         if not person:
             await state.update_salesql_candidate(
@@ -494,23 +551,18 @@ async def _file_people(state, config, rows, people, summary, blocked, confirmed,
         except Exception as e:  # a verifier outage must not lose a paid-for contact
             logger.warning("Email check failed for a SalesQL contact: %s", type(e).__name__)
             status = "guess"
-        answered = False
-        if status == "guess" and salesql_checks:
-            try:
-                answer = await checker.verify_email(email)
-            except sq.SalesQLError as e:
-                # Don't try the rest: a refused key or a spent balance fails
-                # every time, and a failed call may still have been charged.
-                salesql_checks = False
-                summary["messages"].append(
-                    f"SalesQL couldn't check addresses ({e}) If the key lacks the Verify "
-                    "scope, tick it on the key in SalesQL.")
-            else:
-                summary["verifications_used"] += 1
-                answered = True   # "unknown" is an answer: the mail server looked wrong
-                status = {"valid": "verified", "invalid": "invalid",
-                          "catch_all": "risky"}.get(answer, "guess")
-        if status == "guess" and not answered and sq_verified and config.salesql.trust_verified:
+        ready.append([row, person, email, sq_verified, phone, phone_verified, status])
+
+    answers = await _salesql_checks(
+        checker, [r[2] for r in ready if r[6] == "guess"], summary) \
+        if config.salesql.verify_emails else {}
+
+    for row, person, email, sq_verified, phone, phone_verified, status in ready:
+        if status == "guess" and email in answers:
+            # "unknown" is an answer too: the mail server looked wrong.
+            status = {"valid": "verified", "invalid": "invalid",
+                      "catch_all": "risky"}.get(answers[email], "guess")
+        elif status == "guess" and sq_verified and config.salesql.trust_verified:
             status = "verified"
 
         first, last = split_name(person.get("full_name") or row["full_name"])

@@ -248,12 +248,16 @@ async def get_setup_status():
 
     # 4. Email verification (needed for addresses to be sendable, not 'guess')
     verifier_set = _has("REOON_API_KEY") or _has("ZEROBOUNCE_API_KEY") or _has("HUNTER_API_KEY")
+    salesql_checks = _has("SALESQL_API_KEY")
     checks.append({
-        "id": "verifier", "label": "Email verification key",
-        "done": verifier_set,
+        "id": "verifier",
+        "label": "Email verification" + (" (through SalesQL)" if salesql_checks and not verifier_set
+                                         else " key"),
+        "done": verifier_set or salesql_checks,
         "required": True,
-        "help": "Add a Reoon (free 600/mo), ZeroBounce, or Hunter key in Settings — "
-                "without one, found emails stay 'guess' and are never sent.",
+        "help": "Add a Reoon, ZeroBounce or Hunter key in Settings, or connect SalesQL on "
+                "Discover, which checks the addresses it reveals. Without one, found emails "
+                "stay 'guess' and are never sent.",
     })
 
     # 5. Config valid
