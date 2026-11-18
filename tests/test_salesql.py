@@ -973,3 +973,36 @@ async def test_plain_names_from_the_model_are_matched_to_salesqls_lists(state):
     assert aud["industries"]["exclude"] == ["Computer Software", "Software Development", "Retail"]
     assert aud["company_types"]["include"] == ["Privately Held"]
     assert out["notes"] == ['Left out industry "Bakeries": it isn\'t in SalesQL\'s list.']
+
+
+@pytest.mark.asyncio
+async def test_the_main_job_and_company_must_match_not_another_one_they_hold(state):
+    """SalesQL matches filters against any job a person holds and shows the
+    main one, so a search for founders in one industry returns board members
+    of companies in others."""
+    people = [
+        person("m-1", "Ana Example", "Founder & CEO", "o-1", "Northvale Aid", "northvale.example"),
+        person("m-2", "Bo Example", "Advisory Board Member", "o-2", "Lakeside Data", "lakeside.example"),
+        person("m-3", "Cy Example", "Co-Founder", "o-3", "Hillside Apps", "hillside.example"),
+        person("m-4", "Di Example", "Owner", "o-4", "Oak Retail", "oak.example"),
+    ]
+    for p, industry in zip(people, ["Non-profit Organizations", "Non-profit Organizations",
+                                    "Software Development", "Retail"]):
+        p["organization"]["industry"] = industry
+    fake = FakeSalesQL()
+    fake._result_people = people
+    original = fake._result
+    fake._result = lambda name, args: (
+        {"results": people, "total": 4} if name == "search_people"
+        and "organization_uuids" not in args.get("params", {}) else original(name, args))
+    await collector.save_audience(state, audience(
+        job_titles={"include": ["Founder", "Owner", "CEO"], "exclude": []},
+        industries={"include": ["Non-profit Organizations"], "exclude": ["Software Development"]}))
+    await state.set_setting("salesql:lookup:industry:non-profit organizations", "non-profit")
+    await state.set_setting("salesql:lookup:industry:software development", "software-development")
+    await collector.search(state, make_config(), KEY, transport=fake.transport)
+    rows = {r["id"]: r for r in await state.get_salesql_candidates()}
+    assert rows["m-1"]["grade"] == "qualified"
+    assert rows["m-2"]["grade"] == "unsure" and "Advisory Board Member" in rows["m-2"]["reason"]
+    assert rows["m-3"]["grade"] == "rejected" and "which you excluded" in rows["m-3"]["reason"]
+    assert rows["m-4"]["grade"] == "unsure" and "in Retail, not an industry you included" in rows["m-4"]["reason"]
