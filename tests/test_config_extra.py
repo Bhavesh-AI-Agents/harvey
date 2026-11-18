@@ -191,3 +191,19 @@ def test_salesql_settings_have_safe_defaults_and_bounds():
                 {"page_size": 5}, {"page_size": 500}):
         with pytest.raises(ValidationError):
             SalesQLConfig(**bad)
+
+
+def test_a_folder_harvey_may_not_read_is_skipped_when_looking_for_the_config(monkeypatch):
+    """Started from a folder the user can't look into, Harvey used to stop
+    with a permission error before reaching its own config."""
+    from pathlib import Path
+    from harvey import config as cfg
+    real = Path.exists
+
+    def exists(self):
+        if self.parent in (Path("/no-entry"), Path("/")):
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self)
+    monkeypatch.setattr(Path, "cwd", classmethod(lambda cls: Path("/no-entry")))
+    monkeypatch.setattr(Path, "exists", exists)
+    assert cfg._find_config_file().endswith("harvey.yaml")
