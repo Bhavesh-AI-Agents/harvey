@@ -87,3 +87,11 @@ def test_the_card_lists_who_was_found(client, env, monkeypatch):
     assert data["connected"] and data["account"]["credits"] == 50
     assert [c["id"] for c in data["candidates"]] == ["p-1"]
     assert [c["id"] for c in data["handled"]] == ["p-2"]
+
+
+def test_the_daily_cap_can_be_changed_here(client):
+    assert client.post("/api/salesql/cap", json={"cap": 60}).json() == {"success": True, "cap": 60}
+    assert client.get("/api/salesql").json()["cap"] == 60
+    for bad in ({"cap": -1}, {"cap": 5000}, {"cap": "60"}, {}, []):
+        assert client.post("/api/salesql/cap", json=bad).status_code == 400
+    assert client.get("/api/salesql").json()["cap"] == 60

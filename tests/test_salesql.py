@@ -331,7 +331,7 @@ async def test_the_daily_cap_and_the_credits_hold_people_back(state):
     summary = await collector.reveal(state, config, KEY, ["p-ada", "p-ben"], verify=verified,
                                      transport=fake.transport)
     assert summary["revealed"] == 1 and summary["held_back"] == 1
-    assert "max_reveals_per_day" in summary["messages"][0]
+    assert "cap" in summary["messages"][0]
     assert len(fake.tools("enrich_person_bulk")[0]["params"]["persons"]) == 1
     # Tomorrow's allowance is untouched; today's is spent.
     again = await collector.reveal(state, config, KEY, ["p-ben"], verify=verified,
@@ -423,3 +423,21 @@ async def test_a_failed_reveal_still_counts_against_today(state):
         await collector.reveal(state, config, KEY, ["p-ada", "p-ben"], verify=verified,
                                transport=fake.transport)
     assert await collector.reveals_left_today(state, config) == 23
+
+
+@pytest.mark.asyncio
+async def test_the_cap_set_on_the_dashboard_wins_over_the_file(state):
+    config = make_config(max_reveals_per_day=25)
+    assert await collector.daily_cap(state, config) == 25
+    await collector.set_daily_cap(state, 60)
+    assert await collector.daily_cap(state, config) == 60
+    assert await collector.reveals_left_today(state, config) == 60
+    for bad in (-1, 1001, True, "60", None, 2.5):
+        with pytest.raises(ValueError):
+            await collector.set_daily_cap(state, bad)
+    await collector.set_daily_cap(state, 0)
+    fake = FakeSalesQL()
+    await collector.search(state, config, KEY, transport=fake.transport)
+    out = await collector.reveal(state, config, KEY, ["p-ada"], verify=verified,
+                                 transport=fake.transport)
+    assert out["held_back"] == 1 and not fake.tools("enrich_person_bulk")

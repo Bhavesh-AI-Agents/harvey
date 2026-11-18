@@ -296,12 +296,32 @@ def _usage_key() -> str:
     return f"salesql_reveals:{datetime.now(timezone.utc):%Y-%m-%d}"
 
 
+CAP_KEY = "salesql:max_reveals_per_day"
+MAX_CAP = 1000
+
+
+async def daily_cap(state, config) -> int:
+    """The most contacts Harvey reveals in a day: the value set on the
+    dashboard when there is one, else salesql.max_reveals_per_day."""
+    raw = await state.get_setting(CAP_KEY, "")
+    if raw.strip().isdigit() and int(raw) <= MAX_CAP:
+        return int(raw)
+    return config.salesql.max_reveals_per_day
+
+
+async def set_daily_cap(state, value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_CAP:
+        raise ValueError(f"The daily cap must be a whole number from 0 to {MAX_CAP}.")
+    await state.set_setting(CAP_KEY, str(value))
+    return value
+
+
 async def reveals_left_today(state, config) -> int:
     try:
         used = int(await state.get_setting(_usage_key(), "0") or "0")
     except (TypeError, ValueError):
         used = 0
-    return max(config.salesql.max_reveals_per_day - used, 0)
+    return max(await daily_cap(state, config) - used, 0)
 
 
 def pick_email(person: dict, org_domain: str) -> tuple[str, bool]:
@@ -373,7 +393,7 @@ async def reveal(state, config, api_key: str, candidate_ids: list[str], *,
         allowed = min(left, account["credits"], sq.BULK_LIMIT)
         if len(rows) > allowed:
             summary["held_back"] = len(rows) - allowed
-            why = ("today's limit (salesql.max_reveals_per_day)" if left <= account["credits"]
+            why = ("today's cap on reveals" if left <= account["credits"]
                    else "the SalesQL credits you have left")
             summary["messages"].append(
                 f"{summary['held_back']} held back by {why}.")

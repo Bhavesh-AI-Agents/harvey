@@ -781,7 +781,7 @@ async def salesql_overview():
     try:
         from harvey.config import load_config
         config = load_config()
-        out["cap"] = config.salesql.max_reveals_per_day
+        out["cap"] = await collector.daily_cap(state, config)
         out["left_today"] = await collector.reveals_left_today(state, config)
     except Exception:
         config = None
@@ -828,6 +828,25 @@ async def salesql_connect(request: Request):
     return {"success": True,
             "message": f"Connected. {account['credits']} credits left on the "
                        f"{account['plan'] or 'current'} plan."}
+
+
+@app.post("/api/salesql/cap")
+async def salesql_cap(request: Request):
+    """Set the most contacts Harvey may reveal in a day."""
+    from harvey.collectors import salesql as collector
+    try:
+        data = await request.json()
+    except Exception:
+        data = None
+    state = _state()
+    await state.init_db()
+    try:
+        cap = await collector.set_daily_cap(
+            state, data.get("cap") if isinstance(data, dict) else None)
+    except ValueError as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=400)
+    await state.log_action("salesql_cap", "dashboard", {"cap": cap})
+    return {"success": True, "cap": cap}
 
 
 @app.post("/api/salesql/search")

@@ -1137,8 +1137,12 @@ async function loadSalesql() {
     (a ? escHtml(a.plan || 'SalesQL') + ' &middot; ' + a.credits + ' credits left' +
          (a.credits_refresh_date ? ' (refresh ' + escHtml(a.credits_refresh_date) + ')' : '')
        : escHtml(data.error || 'Could not read the account.')) + '</p>' +
-    '<p style="margin:0"><b>Today:</b> ' + data.left_today + ' of ' +
-    data.cap + ' reveals left (your cap in harvey.yaml)</p>' +
+    '<p style="margin:0"><b>Today:</b> ' + data.left_today + ' reveals left of a daily cap of ' +
+    '<input class="form-input" id="salesql-cap" type="number" min="0" max="1000" value="' +
+    data.cap + '" style="display:inline-block;width:86px;margin:0 6px" aria-label="Daily reveal cap">' +
+    '<button class="btn btn-secondary btn-sm" onclick="saveSalesqlCap()">Save</button></p>' +
+    '<p class="desc" style="margin:6px 0 0">The cap is a safety limit on credits spent in one day. ' +
+    'Plan and credits are read from SalesQL each time this card loads and before every reveal.</p>' +
     '<div class="btn-group" style="margin-top:12px">' +
     '<button class="btn btn-secondary" id="salesql-search" onclick="searchSalesql()"' +
     (_salesqlBusy ? ' disabled' : '') + '>Search (free)</button>' +
@@ -1175,6 +1179,18 @@ function countSalesqlPicks() {
   btn.disabled = !n || _salesqlBusy;
   btn.textContent = n ? 'Reveal ' + n + ' (' + n + (n === 1 ? ' credit' : ' credits') + ' at most)'
                       : 'Tick people to reveal';
+}
+
+async function saveSalesqlCap() {
+  const cap = parseInt((document.getElementById('salesql-cap') || {}).value, 10);
+  const data = await api('/api/salesql/cap', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({cap: cap}),
+  });
+  showToast(data && data.success ? 'Daily cap set to ' + data.cap + '.'
+                                  : (data && data.message) || 'Could not save the cap.',
+            data && data.success ? 'success' : 'error');
+  loadSalesql();
 }
 
 async function connectSalesql() {
