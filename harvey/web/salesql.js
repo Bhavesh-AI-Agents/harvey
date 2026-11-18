@@ -182,7 +182,7 @@ async function sqDescribe() {
   if (text.length < 8) { showToast('Describe who you want to find in a sentence or two.', 'error'); return; }
   if (SQ.dirty && !confirm('Replace the filters you have changed but not saved?')) return;
   SQ.busy = 'describe';
-  SQ.describeNote = 'This can take up to a minute.';
+  SQ.describeNote = 'Usually under a minute. A model running on your own machine can take a few minutes.';
   sqRender();
   const data = await sqPost('/api/salesql/describe', {text: text});
   SQ.busy = '';
