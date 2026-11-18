@@ -87,3 +87,39 @@ def test_a_server_with_keys_in_its_environment_and_no_env_file_counts_as_set_up(
     assert main_mod._needs_setup() is False
     cfg.write_text("persona:\n  company: Your Company\n", encoding="utf-8")
     assert main_mod._needs_setup() is True
+
+
+@pytest.fixture
+def business_client(monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+    import harvey.dashboard as dash
+    monkeypatch.setattr(dash, "DB_PATH", tmp_path / "harvey.db")
+    dash.token_store.configure(tmp_path / "data" / "dashboard-token")
+    token = dash.token_store.get()
+    saved = {}
+    import harvey.config as config_mod
+    monkeypatch.setattr(config_mod, "set_business_profile",
+                        lambda values, **k: saved.update(values) or tmp_path / "harvey.local.yaml")
+    monkeypatch.setattr(config_mod, "business_profile", lambda *a, **k: {"sender_email": "", "complete": False})
+    with TestClient(dash.app, base_url="http://127.0.0.1:5555",
+                    headers={"Authorization": f"Bearer {token}"}) as c:
+        c.saved, c.dash = saved, dash
+        yield c
+
+
+def test_the_form_is_told_which_mailboxes_are_connected(business_client, monkeypatch):
+    monkeypatch.setattr(business_client.dash, "_mailbox_addresses", lambda: ["ana@example.com", "ben@example.com"])
+    assert business_client.get("/api/business").json()["mailboxes"] == ["ana@example.com", "ben@example.com"]
+
+
+def test_a_sender_address_that_is_not_a_connected_mailbox_is_refused(business_client, monkeypatch):
+    monkeypatch.setattr(business_client.dash, "_mailbox_addresses", lambda: ["ana@example.com"])
+    r = business_client.post("/api/business", json={"sender_email": "someone@example.org"})
+    assert r.status_code == 400 and "ana@example.com" in r.json()["message"]
+    assert business_client.saved == {}
+    assert business_client.post("/api/business", json={"sender_email": "Ana@Example.com"}).json()["success"] is True
+
+
+def test_with_no_mailboxes_connected_any_sender_address_can_be_typed(business_client, monkeypatch):
+    monkeypatch.setattr(business_client.dash, "_mailbox_addresses", lambda: [])
+    assert business_client.post("/api/business", json={"sender_email": "ana@example.com"}).json()["success"] is True
