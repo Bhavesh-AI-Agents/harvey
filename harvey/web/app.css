@@ -1183,3 +1183,16 @@ a.btn, a.btn:hover { text-decoration: none; }
 .sq-actions-n { flex: 1; font-size: var(--fs-ui); color: var(--text-2); }
 .sq-describe { margin-bottom: var(--sp-4); }
 .sq-describe textarea.form-input { height: auto; min-height: 76px; padding: 10px 12px; line-height: 1.5; resize: vertical; }
+
+/* Settings > Campaign rules */
+.rule-block { padding: 14px 0; border-top: 1px solid var(--border, #e5e7eb); }
+.rule-block:first-of-type { border-top: 0; padding-top: 0; }
+.rule-block h4 { margin: 0 0 4px; font-size: 14px; }
+.rule-block .desc { margin: 0 0 8px; max-width: 760px; }
+.rule-row { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; margin: 8px 0; }
+.rule-row label { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; }
+.rule-row .form-input { width: auto; min-width: 76px; }
+.rule-wide { display: block; font-size: 13px; margin: 8px 0; max-width: 760px; }
+.rule-wide textarea { margin-top: 4px; }
+.rule-note { background: #fff7e6; border: 1px solid #f5d48a; border-radius: 8px; padding: 10px 12px; font-size: 13px; margin-bottom: 14px; }
+.campaign-results { margin-top: 6px; }

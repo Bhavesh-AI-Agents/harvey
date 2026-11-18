@@ -11,7 +11,7 @@ import yaml
 from harvey.textio import read_user_text
 from dotenv import load_dotenv
 from pydantic import (
-    BaseModel, PrivateAttr, TypeAdapter, ValidationError, field_validator, model_validator,
+    BaseModel, Field, PrivateAttr, TypeAdapter, ValidationError, field_validator, model_validator,
 )
 
 from harvey.paths import PROJECT_ROOT
@@ -264,6 +264,10 @@ class EmailChannelConfig(BaseModel):
     # (e.g. your main site when you send from a secondary domain). On
     # autopilot, an email linking anywhere else waits in the Outbox.
     link_domains: list[str] = []
+    # Add ?ref=h-<campaign> to links that point at your own domains, so your
+    # site's analytics can tell which campaign a visit came from. Nothing is
+    # redirected and no tracking domain is used: the link stays yours.
+    tag_links: bool = False
     # Kill switch: pause all sending when bounces exceed this fraction of
     # sent mail (measured over the trailing sends). 0 disables the switch.
     max_bounce_rate: float = 0.05
@@ -717,6 +721,46 @@ class WriterConfig(BaseModel):
     # The FACTS rule, the send gate and do-not-contact still apply. A file
     # that is set but can't be read stops writing until it's fixed.
     email_rules: str = ""
+    # How many emails a sequence has (2 to 6) and the days between them.
+    # sequence_delays lists the wait before email 2, 3, ...; left empty,
+    # the built-in spacing for that length is used (see
+    # harvey.agents.writer.DEFAULT_DELAYS). Emails between the second and
+    # the last are one-line bumps.
+    sequence_steps: int = Field(default=3, ge=2, le=6)
+    sequence_delays: list[int] = []
+    # A/B test: a batch of at least ab_min_prospects is split in two, and
+    # each half is written with its own angle. The Campaigns tab shows sent
+    # and replies for each half. Blank angles use the built-in pair.
+    ab_test: bool = False
+    ab_min_prospects: int = Field(default=20, ge=4, le=1000)
+    ab_angle_a: str = ""
+    ab_angle_b: str = ""
+    # Tell the Writer how earlier campaigns did (sent, replies, interested),
+    # counting only campaigns with at least learn_min_sent first emails sent.
+    learn_from_results: bool = False
+    learn_min_sent: int = Field(default=20, ge=5, le=10000)
+
+    @field_validator("sequence_delays", mode="before")
+    @classmethod
+    def _valid_delays(cls, v):
+        if v in (None, ""):
+            return []
+        if not isinstance(v, list) or len(v) > 5:
+            raise ValueError("sequence_delays is a list of up to 5 numbers of days")
+        out = []
+        for d in v:
+            if isinstance(d, bool) or not isinstance(d, int) or not 1 <= d <= 30:
+                raise ValueError("each wait in sequence_delays is a whole number of days from 1 to 30")
+            out.append(d)
+        return out
+
+    @field_validator("ab_angle_a", "ab_angle_b", mode="before")
+    @classmethod
+    def _angle_text(cls, v):
+        text = " ".join(str(v or "").split())
+        if len(text) > 400:
+            raise ValueError("an A/B angle is at most 400 characters")
+        return text
 
     @field_validator("email_rules", mode="before")
     @classmethod
@@ -1340,3 +1384,145 @@ def _find_config_file() -> str:
         + ", ".join(str(p.parent) for p in candidates)
         + ". Create one from harvey.yaml.example or run 'harvey setup'."
     )
+
+
+# ---- Campaign rules (Settings > Campaign rules) ----------------------------
+
+# What the cold-email evidence in skills/email_frameworks.md points to. The
+# dashboard offers these until the user saves their own.
+RECOMMENDED_CAMPAIGN_RULES = {
+    "send_window_on": True, "send_start": "08:00", "send_end": "17:00",
+    "weekdays_only": True, "recipient_timezone": True,
+    "sequence_steps": 5, "sequence_delays": [3, 4, 7, 7],
+    "ab_test": True, "ab_min_prospects": 20, "ab_angle_a": "", "ab_angle_b": "",
+    "learn_from_results": True, "learn_min_sent": 20,
+    "tag_links": True,
+}
+_RULE_KEYS_WRITER = ("sequence_steps", "sequence_delays", "ab_test", "ab_min_prospects",
+                     "ab_angle_a", "ab_angle_b", "learn_from_results", "learn_min_sent")
+
+
+def _read_settings_file(source) -> dict:
+    try:
+        data = yaml.safe_load(read_user_text(source))
+    except (OSError, yaml.YAMLError) as e:
+        raise ConfigError(f"Could not read {Path(source).name}: {e}")
+    if not isinstance(data, dict):
+        raise ConfigError(f"{Path(source).name} isn't a settings file Harvey can read.")
+    return data
+
+
+def campaign_rules(path=None) -> dict:
+    """The campaign rules in force, what is recommended, and whether the
+    user has saved any of their own yet."""
+    source = Path(path or _find_config_file())
+    try:
+        data = _read_settings_file(source)
+    except ConfigError:
+        data = {}
+    email = _dig(data, ("channels", "email")) or {}
+    email = email if isinstance(email, dict) else {}
+    writer = data.get("writer") if isinstance(data.get("writer"), dict) else {}
+    window = email.get("send_window") if isinstance(email.get("send_window"), dict) else None
+    defaults = WriterConfig()
+    values = {
+        "send_window_on": window is not None,
+        "send_start": str((window or {}).get("start") or "08:00"),
+        "send_end": str((window or {}).get("end") or "17:00"),
+        "weekdays_only": bool((window or {}).get("weekdays_only", True)),
+        "recipient_timezone": bool((window or {}).get("recipient_timezone", True)),
+        "tag_links": bool(email.get("tag_links", False)),
+    }
+    for key in _RULE_KEYS_WRITER:
+        values[key] = writer.get(key, getattr(defaults, key))
+    saved = window is not None or "tag_links" in email or any(k in writer for k in _RULE_KEYS_WRITER)
+    return {"values": values, "recommended": dict(RECOMMENDED_CAMPAIGN_RULES), "saved": saved}
+
+
+def set_campaign_rules(values: dict, source=None, target=None) -> Path:
+    """Save the campaign rules into harvey.local.yaml. Everything else in
+    the config is kept. Raises ConfigError with a message for the form."""
+    if not isinstance(values, dict):
+        raise ConfigError("Send the rules as JSON.")
+    source = Path(source or _find_config_file())
+    target = Path(target or (source if source.name == "harvey.local.yaml"
+                             else PROJECT_ROOT / "harvey.local.yaml"))
+    data = _read_settings_file(source)
+    merged = {**campaign_rules(source)["values"], **{k: v for k, v in values.items()
+                                                      if k in RECOMMENDED_CAMPAIGN_RULES}}
+    for key in ("send_window_on", "weekdays_only", "recipient_timezone", "ab_test",
+                "learn_from_results", "tag_links"):
+        if not isinstance(merged[key], bool):
+            raise ConfigError(f"{key.replace('_', ' ').capitalize()} must be on or off.")
+    steps = merged["sequence_steps"]
+    if isinstance(steps, bool) or not isinstance(steps, int) or not 2 <= steps <= 6:
+        raise ConfigError("A sequence has 2 to 6 emails.")
+    delays = merged["sequence_delays"]
+    if delays and (not isinstance(delays, list) or len(delays) != steps - 1):
+        raise ConfigError(f"Give {steps - 1} waits (days before email 2 to {steps}), or none "
+                          "to use the built-in spacing.")
+    for node_key in ("channels", "writer"):
+        if not isinstance(data.get(node_key), dict):
+            data[node_key] = {}
+    if not isinstance(data["channels"].get("email"), dict):
+        data["channels"]["email"] = {}
+    email = data["channels"]["email"]
+    if merged["send_window_on"]:
+        email["send_window"] = {"start": merged["send_start"], "end": merged["send_end"],
+                                "weekdays_only": merged["weekdays_only"],
+                                "recipient_timezone": merged["recipient_timezone"]}
+    else:
+        email.pop("send_window", None)
+    email["tag_links"] = merged["tag_links"]
+    for key in _RULE_KEYS_WRITER:
+        data["writer"][key] = merged[key]
+    try:
+        HarveyConfig(**data)
+    except ValidationError as e:
+        raise ConfigError(f"That can't be saved:\n{_format_validation_error(e)}")
+    text = ("# Harvey's settings for this business. Written by the dashboard (Settings);\n"
+            "# this file wins over harvey.yaml. Edit it there or here.\n\n"
+            + yaml.safe_dump(data, sort_keys=False, allow_unicode=True, width=100))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return target
+
+
+# ---- Product knowledge (Settings > Product knowledge) ----------------------
+
+PRODUCT_KNOWLEDGE_FILE = "skills/product_knowledge.md"
+MAX_PRODUCT_KNOWLEDGE_CHARS = 20_000
+
+
+def product_knowledge(root=None) -> str:
+    try:
+        return read_user_text(Path(root or PROJECT_ROOT) / PRODUCT_KNOWLEDGE_FILE)
+    except OSError:
+        return ""
+
+
+def set_product_knowledge(text, root=None) -> Path:
+    """Save what Harvey knows about the product. Every agent that writes or
+    answers reads this file, so it holds only what may be said to a prospect."""
+    if not isinstance(text, str):
+        raise ConfigError("Product knowledge must be text.")
+    text = text.replace("\r\n", "\n").strip()
+    if len(text) > MAX_PRODUCT_KNOWLEDGE_CHARS:
+        raise ConfigError(f"Product knowledge is at most {MAX_PRODUCT_KNOWLEDGE_CHARS:,} characters.")
+    target = Path(root or PROJECT_ROOT) / PRODUCT_KNOWLEDGE_FILE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not text:
+        target.unlink(missing_ok=True)
+        return target
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        tmp.write_text(text + "\n", encoding="utf-8")
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return target

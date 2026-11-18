@@ -23,6 +23,7 @@ from harvey.config import (
     compliance_of, live_do_not_contact, operator_timezone, send_window_of,
 )
 from harvey import mailboxes
+from harvey.agents.writer import tag_links
 from harvey.gate import autopilot_review, do_not_contact_match, pre_send_check
 from harvey.send_window import in_window, next_send_time, recipient_country, recipient_zone
 from harvey.integrations.instantly import InstantlyClient
@@ -713,9 +714,11 @@ class Sender:
                     step=step.step,
                     to_email=email,
                     subject=self._render(step.subject, prospect),
-                    body=(mailboxes.resign(self._render(step.body, prospect),
-                                           self.config.persona.name, box)
-                          if box is not None else self._render(step.body, prospect)),
+                    body=tag_links(
+                        mailboxes.resign(self._render(step.body, prospect),
+                                         self.config.persona.name, box)
+                        if box is not None else self._render(step.body, prospect),
+                        self.config, campaign.id),
                     send_at=send_at.isoformat(),
                     status=initial_status,
                     provider=self.provider.name,

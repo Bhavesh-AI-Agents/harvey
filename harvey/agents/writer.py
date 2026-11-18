@@ -49,6 +49,80 @@ PERSONAL_SHAPE = """- Under 75 words. One specific observation from the FACTS ab
 SEQUENCE_SHAPE = """- Email 1: Personalized cold observation + one question. Under 75 words. No pitch.
 - Email 2: Follow-up 3 days later. Different angle, one concrete proof point. Under 75 words.
 - Email 3: Break-up email 4 days after that. Under 40 words. Gracious, not guilt-tripping."""
+# Days to wait before email 2, 3, ... for each sequence length, when the
+# user hasn't set their own (writer.sequence_delays). About 6 touches over
+# 14 to 28 days is what the reply data favours; 3 is the long-standing default.
+DEFAULT_DELAYS = {2: [4], 3: [3, 4], 4: [3, 4, 7], 5: [3, 4, 7, 7], 6: [3, 4, 5, 7, 7]}
+# The built-in A/B pair: an easy question against a give-first offer.
+AB_ANGLE_A = ("Lead with one specific observation about their business and end with one "
+              "easy question they can answer in a line.")
+AB_ANGLE_B = ("Lead with one specific observation, then offer one useful thing they get "
+              "whether or not they buy, taken only from the product information above, "
+              "and ask if they want it.")
+CAMPAIGN_VARIANT_KEY = "campaign_variant:"
+
+
+def sequence_plan(config) -> list[int]:
+    """delay_days for each email of a sequence, first one 0."""
+    writer = getattr(config, "writer", None)
+    steps = int(getattr(writer, "sequence_steps", 3) or 3)
+    steps = min(6, max(2, steps))
+    delays = list(getattr(writer, "sequence_delays", None) or [])
+    if len(delays) != steps - 1:
+        delays = DEFAULT_DELAYS[steps]
+    return [0] + [int(d) for d in delays]
+
+
+def sequence_shape(plan: list[int]) -> str:
+    """What each email of the sequence is, one line each."""
+    last = len(plan)
+    lines = ["- Email 1: Personalized cold observation + one question. Under 75 words. No pitch."]
+    for n in range(2, last + 1):
+        when = f"{plan[n - 1]} days " + ("later" if n == 2 else "after that")
+        if n == last:
+            lines.append(f"- Email {n}: Break-up email {when}. Under 40 words. "
+                         "Gracious, not guilt-tripping.")
+        elif n == 2:
+            lines.append(f"- Email 2: Follow-up {when}. Different angle, one concrete "
+                         "proof point. Under 75 words.")
+        else:
+            lines.append(f"- Email {n}: Bump {when}. One or two sentences, under 30 words. "
+                         "One new small reason to reply or one easy question. Never "
+                         "\"just following up\", never a re-pitch.")
+    if last != 3:
+        lines.append(f"- Where the STRICT EMAIL RULES give a word limit for \"Email 3\", "
+                     f"it applies to the last email here (email {last}).")
+    return "\n".join(lines)
+
+
+def tag_links(text: str, config, campaign_id: str) -> str:
+    """Add ?ref=h-<campaign> to links on the user's own domains, when
+    channels.email.tag_links is on. Other links are left alone."""
+    if not text or not campaign_id or not getattr(config.channels.email, "tag_links", False):
+        return text
+    from harvey.gate import allowed_link_domains
+    try:
+        own = allowed_link_domains(config)
+    except Exception:
+        return text
+    tag = "ref=h-" + re.sub(r"[^A-Za-z0-9]", "", str(campaign_id))[:8]
+
+    def one(match):
+        url = match.group(0)
+        trail = ""
+        while url and url[-1] in ".,;:!?)'\"":
+            url, trail = url[:-1], url[-1] + trail
+        host = re.sub(r"^https?://", "", url).split("/")[0].split("?")[0].split("#")[0].lower()
+        host = host.split("@")[-1].split(":")[0]
+        if not any(host == d or host.endswith("." + d) for d in own) or "ref=" in url:
+            return url + trail
+        base, _, frag = url.partition("#")
+        base += ("&" if "?" in base else "?") + tag
+        return base + (("#" + frag) if frag else "") + trail
+
+    return re.sub(r"https?://[^\s<>]+", one, text)
+
+
 SEQUENCE_STYLE = """- Never be pushy or salesy. Be consultative and value-driven.
 - Subject lines: lowercase, 2-5 words."""
 # Why the Writer stopped: Today and `harvey status` show it.
@@ -162,9 +236,12 @@ class Writer:
         # Batch prospects into campaign groups (by industry/title for relevance)
         batches = self._group_prospects(prospects_with_email)
 
+        batches = self._ab_split(batches)
+
         for batch_name, prospects in batches.items():
             if not prospects:
                 continue
+            angle = self._batch_angles.get(batch_name, ("", ""))
 
             logger.info(
                 f"Writer: Creating campaign '{batch_name}' for "
@@ -173,7 +250,7 @@ class Writer:
 
             # Generate the email sequence
             self._no_reply = False
-            sequence = await self._write_sequence(prospects)
+            sequence = await self._write_sequence(prospects, angle=angle[1])
             if not sequence:
                 paused = getattr(self.brain, "paused_reason", "") or (
                     "no reply from the model" if self._no_reply else "")
@@ -197,6 +274,10 @@ class Writer:
                 status="draft",
             )
             campaign_id = await self.state.add_campaign(campaign)
+            if angle[0]:
+                await self.state.set_setting(
+                    CAMPAIGN_VARIANT_KEY + campaign_id,
+                    json.dumps({"variant": angle[0], "angle": angle[1]}))
 
             # Mark prospects so they aren't picked up again
             for p in prospects:
@@ -206,7 +287,7 @@ class Writer:
             # Native providers: replace the shared template for email 1 with
             # a per-prospect draft grounded in that company's actual facts.
             if self.is_native:
-                await self._personalize_first_emails(campaign_id, prospects)
+                await self._personalize_first_emails(campaign_id, prospects, angle=angle[1])
 
             await self.state.log_action(
                 action_type="write_campaign",
@@ -222,6 +303,61 @@ class Writer:
                 f"Writer: Campaign '{batch_name}' created with "
                 f"{len(sequence)} emails for {len(prospects)} prospects."
             )
+
+    _batch_angles: dict = {}
+
+    def _ab_split(self, batches: dict) -> dict:
+        """With writer.ab_test on, split each batch that is big enough into
+        an A half and a B half (alternating, so both halves look alike), and
+        remember the angle each half is written with."""
+        self._batch_angles = {}
+        writer = getattr(self.config, "writer", None)
+        if not getattr(writer, "ab_test", False):
+            return batches
+        minimum = int(getattr(writer, "ab_min_prospects", 20) or 20)
+        angle_a = getattr(writer, "ab_angle_a", "") or AB_ANGLE_A
+        angle_b = getattr(writer, "ab_angle_b", "") or AB_ANGLE_B
+        out = {}
+        for name, prospects in batches.items():
+            if len(prospects) < minimum:
+                out[name] = prospects
+                continue
+            out[name + " (A)"], out[name + " (B)"] = prospects[0::2], prospects[1::2]
+            self._batch_angles[name + " (A)"] = ("A", angle_a)
+            self._batch_angles[name + " (B)"] = ("B", angle_b)
+        return out
+
+    async def _results_block(self) -> str:
+        """How earlier campaigns did, for the Writer to lean on. Empty until
+        writer.learn_from_results is on and a campaign has enough sends."""
+        writer = getattr(self.config, "writer", None)
+        if not getattr(writer, "learn_from_results", False):
+            return ""
+        try:
+            rows = await self.state.campaign_results(
+                int(getattr(writer, "learn_min_sent", 20) or 20))
+        except Exception as e:
+            logger.warning(f"Writer: could not read campaign results: {e}")
+            return ""
+        if not rows:
+            return ""
+        lines = []
+        for r in rows[:8]:
+            rate = round(r["replies"] / r["sent"] * 100, 1) if r["sent"] else 0
+            line = (f"- {r['sent']} sent, {r['replies']} replies ({rate}%), "
+                    f"{r['interested']} interested")
+            if r.get("angle"):
+                line += f" | angle: {r['angle']}"
+            if r.get("subject"):
+                line += f" | follow-up subject: {r['subject']}"
+            lines.append(line)
+        return (
+            "\n\nRESULTS SO FAR — how this business's earlier campaigns did, best reply\n"
+            "rate first. Lean toward the angles and subject styles that earned replies\n"
+            "and away from those that did not. Small numbers are weak evidence: treat a\n"
+            "difference of a reply or two as noise. This never overrides the STRICT\n"
+            "EMAIL RULES or the FACTS rule:\n" + "\n".join(lines)
+        )
 
     async def _count_failed_attempt(self, batch_name: str, prospects: list):
         """Count one unusable sequence against each prospect in the batch.
@@ -255,7 +391,7 @@ class Writer:
                 f"{MAX_WRITE_ATTEMPTS} unusable drafts; marked write_failed."
             )
 
-    async def _personalize_first_emails(self, campaign_id: str, prospects: list):
+    async def _personalize_first_emails(self, campaign_id: str, prospects: list, angle: str = ""):
         """Draft a grounded, per-prospect email 1 and stage it in the outbox.
 
         The outbox unique index means the sender's later template staging
@@ -274,7 +410,7 @@ class Writer:
         pending = []
         for prospect in prospects:
             try:
-                draft = await self._write_personal_email(prospect)
+                draft = await self._write_personal_email(prospect, angle=angle)
             except Exception as e:
                 logger.warning(f"Writer: personal draft failed for {prospect.email}: {e}")
                 continue
@@ -295,7 +431,7 @@ class Writer:
                 step=1,
                 to_email=prospect.email,
                 subject=draft["subject"],
-                body=draft["body"],
+                body=tag_links(draft["body"], self.config, campaign_id),
                 send_at=now,
                 status=status,
                 provider=provider,
@@ -340,7 +476,7 @@ class Writer:
             + lines
         )
 
-    async def _write_personal_email(self, prospect) -> dict | None:
+    async def _write_personal_email(self, prospect, angle: str = "") -> dict | None:
         """One grounded draft for one person. Facts in, one email out."""
         inbox_rule = ""
         if prospect.is_company_inbox:
@@ -398,6 +534,7 @@ class Writer:
         if startup is not None:
             prompt += self._startup_playbook()
         prompt += await self._feedback_block([prospect.id])
+        prompt += await self._results_block()
         rules = getattr(self, "email_rules", "")
         prompt += operator_rules_block(rules)
         if rules:
@@ -425,7 +562,7 @@ funding rounds, mutual contacts, metrics, or anything else:
 Requirements:
 {shape}
 {footer_rule(self.config, rules)}
-{strict}{inbox_rule}
+{strict}{inbox_rule}{self._angle_rule(angle)}
 
 Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
 
@@ -441,8 +578,17 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
             return None
         return {"subject": subject[:120], "body": body[:2000]}
 
-    async def _write_sequence(self, prospects: list) -> list[EmailStep]:
-        """Ask the brain to write a 3-email sequence."""
+    @staticmethod
+    def _angle_rule(angle: str) -> str:
+        if not angle:
+            return ""
+        return ("\n- ANGLE FOR THIS TEST GROUP (set by the person running Harvey; it shapes\n"
+                "  the first email and the follow-up, inside every rule above): " + angle)
+
+    async def _write_sequence(self, prospects: list, angle: str = "") -> list[EmailStep]:
+        """Ask the brain to write the sequence (writer.sequence_steps emails)."""
+        plan = sequence_plan(self.config)
+        count = len(plan)
         # Build context about the prospects
         prospect_summary = "\n".join(
             f"- {p.full_name()}, {p.title} at {p.company}"
@@ -495,24 +641,34 @@ Pricing: {self.config.product.pricing}"""
         # Campaign notes only: this template goes to the whole batch, so a
         # note about one person ("met her at the expo") must never reach it.
         prompt += await self._feedback_block([])
+        prompt += await self._results_block()
         rules = getattr(self, "email_rules", "")
         prompt += operator_rules_block(rules)
         if rules:
+            if count == 3 and plan == [0, 3, 4]:
+                timing = ("- Email 1 is the first touch, email 2 a follow-up 3 days later, email 3 a\n"
+                          "  last one 4 days after that.")
+            else:
+                timing = ("- Email 1 is the first touch; " + "; ".join(
+                    f"email {n} follows {plan[n - 1]} days after email {n - 1}"
+                    for n in range(2, count + 1)) + f". Email {count} is the last one.")
             shape = (
-                "- Email 1 is the first touch, email 2 a follow-up 3 days later, email 3 a\n"
-                "  last one 4 days after that. Follow the OPERATOR'S EMAIL RULES above for\n"
+                timing + " Follow the OPERATOR'S EMAIL RULES above for\n"
                 "  each one's length, structure, what it says about the product, links and\n"
                 "  subject line.")
             style = ""
             strict = ("- Follow every rule in the STRICT EMAIL RULES above that the operator's\n"
                       "  rules don't replace.")
         else:
-            shape, style = SEQUENCE_SHAPE, "\n" + SEQUENCE_STYLE
+            shape, style = sequence_shape(plan), "\n" + SEQUENCE_STYLE
             strict = "- Follow every rule in the STRICT EMAIL RULES above. No exceptions."
 
+        example = ",\n".join(
+            f'  {{"step": {n}, "subject": "...", "body": "...", "delay_days": {d}}}'
+            for n, d in enumerate(plan, 1))
         prompt += f"""
 
-Write a 3-email cold outreach sequence for prospects like these:
+Write a {count}-email cold outreach sequence for prospects like these:
 {fence(prospect_summary, "sample prospects")}
 
 {UNTRUSTED_RULE}
@@ -521,13 +677,11 @@ Requirements:
 {shape}
 {merge_rule}{style}
 {footer_rule(self.config, rules)}
-{strict}
+{strict}{self._angle_rule(angle)}
 
-Return ONLY a JSON array (no markdown fences, no commentary):
+Return ONLY a JSON array of exactly {count} emails (no markdown fences, no commentary):
 [
-  {{"step": 1, "subject": "...", "body": "...", "delay_days": 0}},
-  {{"step": 2, "subject": "...", "body": "...", "delay_days": 3}},
-  {{"step": 3, "subject": "...", "body": "...", "delay_days": 4}}
+{example}
 ]"""
 
         result = await self.brain.think_json(
@@ -536,7 +690,10 @@ Return ONLY a JSON array (no markdown fences, no commentary):
         )
         # Read right after the call, before anything else can use the brain.
         self._no_reply = result is None and bool(getattr(self.brain, "last_reply_empty", False))
-        steps = self._parse_sequence(result)
+        steps = self._parse_sequence(result, expected=count)
+        # The spacing is the user's setting, not the model's choice.
+        for step, delay in zip(steps, plan):
+            step.delay_days = delay
         if inbox_batch and any(
             PERSON_VAR.search(s.subject + s.body) for s in steps
         ):
@@ -552,7 +709,7 @@ Return ONLY a JSON array (no markdown fences, no commentary):
             step.subject, step.body = draft["subject"], draft["body"]
         return steps
 
-    def _parse_sequence(self, result) -> list[EmailStep]:
+    def _parse_sequence(self, result, expected: int = 3) -> list[EmailStep]:
         """Robustly coerce LLM output into a validated EmailStep list.
 
         Never raises. Tolerates a wrapper dict ({"emails": [...]}), missing
@@ -570,7 +727,7 @@ Return ONLY a JSON array (no markdown fences, no commentary):
             return []
 
         steps: list[EmailStep] = []
-        for i, raw in enumerate(result[:5]):  # never accept absurdly long sequences
+        for i, raw in enumerate(result[:max(5, expected)]):  # never accept absurdly long sequences
             if not isinstance(raw, dict):
                 logger.warning(f"Writer: Skipping non-dict step at index {i}.")
                 continue
@@ -598,8 +755,8 @@ Return ONLY a JSON array (no markdown fences, no commentary):
         if steps and steps[0].delay_days != 0:
             steps[0].delay_days = 0  # first email always sends immediately
 
-        if len(steps) < 3:
-            logger.warning(f"Writer: Expected 3 emails, got {len(steps)}.")
+        if len(steps) < expected:
+            logger.warning(f"Writer: Expected {expected} emails, got {len(steps)}.")
         return steps
 
     def _group_prospects(self, prospects: list) -> dict[str, list]:
