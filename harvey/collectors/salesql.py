@@ -20,6 +20,8 @@ identifier SalesQL returns and accepts.
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 import re
 from datetime import datetime, timezone
@@ -275,10 +277,23 @@ async def count_developers(client, org_uuids: list[str], developer_titles) -> di
 
 async def search(state, config, api_key: str, *, transport=None) -> dict:
     """Run one search, grade the results and store them. Spends no credits."""
+    config = await _with_search_settings(state, config)
     cfg = config.salesql
     async with sq.SalesQL(api_key, transport=transport) as client:
         filters, notes = await build_filters(client, state, config)
-        found = await client.search_people(filters, page_size=cfg.page_size)
+        # Each search with the same settings reads the next page, so pressing
+        # Search again brings new people, not the same ones.
+        page_key = "salesql:page:" + hashlib.sha256(
+            json.dumps([filters, cfg.page_size], sort_keys=True).encode()).hexdigest()[:24]
+        raw = await state.get_setting(page_key, "")
+        page = int(raw) if raw.isdigit() and 1 <= int(raw) <= 500 else 1
+        found = await client.search_people(filters, page=page, page_size=cfg.page_size)
+        if not found["results"] and page > 1:
+            notes.append("That was everyone SalesQL has for these settings. "
+                         "The next search starts again from the top.")
+            await state.set_setting(page_key, "1")
+        elif found["results"]:
+            await state.set_setting(page_key, str(page + 1))
         people = [c for c in (candidate_from_result(r) for r in found["results"]) if c["id"]]
         sizes = set(filters.get("organization_employee_ranges") or [])
         tech = cfg.technical_words
@@ -314,6 +329,92 @@ async def search(state, config, api_key: str, *, transport=None) -> dict:
 
 def _usage_key() -> str:
     return f"salesql_reveals:{datetime.now(timezone.utc):%Y-%m-%d}"
+
+
+SEARCH_KEY = "salesql:search_settings"
+LIST_FIELDS = ("job_titles", "company_sizes", "countries", "states", "industries",
+               "company_keywords")
+MAX_LIST = 30
+
+
+async def search_settings(state, config) -> dict:
+    """Who a search looks for: what was saved on the dashboard, and for
+    anything never saved there, what harvey.yaml says."""
+    cfg, icp = config.salesql, config.icp
+    out = {
+        "job_titles": list(cfg.job_titles or icp.titles),
+        "company_sizes": [x for x in cfg.company_sizes if x in {r[0] for r in SIZE_RANGES}]
+        or sizes_for(icp.company_size),
+        "countries": list(cfg.countries or icp.geography),
+        "states": list(cfg.states),
+        "industries": list(cfg.industries or icp.industries),
+        "company_keywords": list(cfg.company_keywords),
+        "require_no_developers": cfg.require_no_developers,
+        "page_size": cfg.page_size,
+    }
+    try:
+        saved = json.loads(await state.get_setting(SEARCH_KEY, "") or "{}")
+    except ValueError:
+        saved = {}
+    if isinstance(saved, dict):
+        try:
+            out.update(_clean_search_settings(saved))
+        except ValueError:
+            pass
+    return out
+
+
+def _clean_search_settings(data) -> dict:
+    """The search settings present in ``data``, checked. Raises ValueError
+    with a message a person can act on."""
+    if not isinstance(data, dict):
+        raise ValueError("Send the search settings as JSON.")
+    out: dict = {}
+    for field in LIST_FIELDS:
+        if field not in data:
+            continue
+        values = data[field]
+        if not isinstance(values, list) or len(values) > MAX_LIST \
+                or not all(isinstance(v, str) and len(v) <= 80 for v in values):
+            raise ValueError(f"{field.replace('_', ' ').capitalize()}: up to {MAX_LIST} "
+                             "entries of at most 80 characters each.")
+        out[field] = list(dict.fromkeys(re.sub(r"\s+", " ", v).strip()
+                                        for v in values if v.strip()))
+    if "company_sizes" in out:
+        known = [r[0] for r in SIZE_RANGES]
+        bad = [v for v in out["company_sizes"] if v not in known]
+        if bad:
+            raise ValueError("Company sizes must be from: " + ", ".join(known) + ".")
+    if "job_titles" in out and not out["job_titles"]:
+        raise ValueError("Give at least one job title to search for.")
+    if "require_no_developers" in data:
+        if not isinstance(data["require_no_developers"], bool):
+            raise ValueError("'require_no_developers' must be true or false.")
+        out["require_no_developers"] = data["require_no_developers"]
+    if "page_size" in data:
+        size = data["page_size"]
+        if isinstance(size, bool) or not isinstance(size, int) or not 20 <= size <= 100:
+            raise ValueError("Results per search must be a whole number from 20 to 100.")
+        out["page_size"] = size
+    return out
+
+
+async def set_search_settings(state, config, data) -> dict:
+    """Save the search settings sent from the dashboard; returns all of them."""
+    changes = _clean_search_settings(data)
+    try:
+        saved = json.loads(await state.get_setting(SEARCH_KEY, "") or "{}")
+    except ValueError:
+        saved = {}
+    saved = {**(saved if isinstance(saved, dict) else {}), **changes}
+    await state.set_setting(SEARCH_KEY, json.dumps(saved))
+    return await search_settings(state, config)
+
+
+async def _with_search_settings(state, config):
+    """``config`` with the dashboard's search settings laid over salesql.*."""
+    values = await search_settings(state, config)
+    return config.model_copy(update={"salesql": config.salesql.model_copy(update=values)})
 
 
 CAP_KEY = "salesql:max_reveals_per_day"

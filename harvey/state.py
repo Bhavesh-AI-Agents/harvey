@@ -9,6 +9,7 @@ list tracked with SQLite's ``PRAGMA user_version`` so existing user DBs
 upgrade cleanly in place.
 """
 
+import asyncio
 import json
 import sqlite3
 import uuid
@@ -640,7 +641,18 @@ class StateManager:
         async with self._connect() as db:
             # WAL is persistent in the DB file: readers (dashboard) never
             # block the writer (agent) and vice versa.
-            await db.execute("PRAGMA journal_mode=WAL")
+            # Switching a new file to WAL doesn't wait for a lock the way
+            # other statements do, so a second process starting at the same
+            # moment would fail here. Try again briefly; the mode is stored
+            # in the file, so whichever process gets there sets it for all.
+            for attempt in range(100):
+                try:
+                    await db.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as e:
+                    if "locked" not in str(e).lower() or attempt == 99:
+                        raise
+                    await asyncio.sleep(0.05)
             await db.execute("PRAGMA synchronous=NORMAL")
 
             async with db.execute("PRAGMA user_version") as cursor:

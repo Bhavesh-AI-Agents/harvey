@@ -797,6 +797,8 @@ async def salesql_overview():
         config = load_config()
         out["cap"] = await collector.daily_cap(state, config)
         out["left_today"] = await collector.reveals_left_today(state, config)
+        out["search"] = await collector.search_settings(state, config)
+        out["sizes"] = [r[0] for r in collector.SIZE_RANGES]
     except Exception:
         config = None
         out["error"] = "harvey.yaml couldn't be read."
@@ -861,6 +863,29 @@ async def salesql_cap(request: Request):
         return JSONResponse({"success": False, "message": str(e)}, status_code=400)
     await state.log_action("salesql_cap", "dashboard", {"cap": cap})
     return {"success": True, "cap": cap}
+
+
+@app.post("/api/salesql/settings")
+async def salesql_settings(request: Request):
+    """Save who a search looks for: titles, size, place, industries."""
+    from harvey.collectors import salesql as collector
+    try:
+        data = await request.json()
+    except Exception:
+        data = None
+    state = _state()
+    await state.init_db()
+    try:
+        from harvey.config import load_config
+        saved = await collector.set_search_settings(state, load_config(), data)
+    except ValueError as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=400)
+    except Exception:
+        return JSONResponse({"success": False, "message": "harvey.yaml couldn't be read."},
+                            status_code=400)
+    await state.log_action("salesql_settings", "dashboard",
+                           {k: len(v) if isinstance(v, list) else v for k, v in saved.items()})
+    return {"success": True, "search": saved}
 
 
 @app.post("/api/salesql/search")

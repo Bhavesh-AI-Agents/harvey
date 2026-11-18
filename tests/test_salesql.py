@@ -543,3 +543,44 @@ async def test_many_addresses_are_checked_in_one_reveal(state):
     assert out["revealed"] == 3 and out["verifications_used"] == 3
     assert sorted(c["params"]["email"] for c in fake.tools("verify_email")) == [
         "p-ada@northvale.example", "p-ben@lakeside.example", "p-cal@hillside.example"]
+
+
+@pytest.mark.asyncio
+async def test_search_settings_saved_on_the_dashboard_replace_the_file(state):
+    config = make_config()
+    before = await collector.search_settings(state, config)
+    assert before["job_titles"] == ["Founder", "Owner"] and before["states"] == []
+    saved = await collector.set_search_settings(state, config, {
+        "job_titles": ["Owner", " Owner ", "President"], "states": ["California"],
+        "company_sizes": ["1-10"], "require_no_developers": False, "page_size": 50})
+    assert saved["job_titles"] == ["Owner", "President"] and saved["page_size"] == 50
+    fake = FakeSalesQL()
+    await collector.search(state, config, KEY, transport=fake.transport)
+    sent = fake.tools("search_people")[0]["params"]
+    assert sent["job_titles"] == {"include": ["Owner", "President"]}
+    assert sent["organization_employee_ranges"] == ["1-10"] and sent["page_size"] == 50
+    assert sent["states_or_cities"] == ["r-ca"] and len(fake.tools("search_people")) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [
+    {"job_titles": []}, {"job_titles": "Owner"}, {"company_sizes": ["2-9"]},
+    {"page_size": 500}, {"page_size": True}, {"require_no_developers": "yes"},
+    {"states": ["x" * 81]}, "nope"])
+async def test_search_settings_that_make_no_sense_are_refused(state, bad):
+    with pytest.raises(ValueError):
+        await collector.set_search_settings(state, make_config(), bad)
+    assert await collector.search_settings(state, make_config()) \
+        == await collector.search_settings(state, make_config())
+
+
+@pytest.mark.asyncio
+async def test_searching_again_reads_the_next_page(state):
+    fake = FakeSalesQL()
+    config = make_config(require_no_developers=False)
+    await collector.search(state, config, KEY, transport=fake.transport)
+    await collector.search(state, config, KEY, transport=fake.transport)
+    assert [c["params"]["page"] for c in fake.tools("search_people")] == [1, 2]
+    await collector.set_search_settings(state, config, {"job_titles": ["President"]})
+    await collector.search(state, config, KEY, transport=fake.transport)
+    assert fake.tools("search_people")[-1]["params"]["page"] == 1
