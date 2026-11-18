@@ -690,10 +690,19 @@ PICK_PROMPT = """A salesperson described the companies they want to reach. Choos
 They want companies in: {include}
 They do not want companies in: {exclude}
 
-Reply with ONE JSON object: {{"include": [...], "exclude": [...]}}. Copy names exactly from the list. For "include", take every
-industry a company of the wanted kind could be filed under, the broad ones and the narrow ones, old names and new (a taxi firm
-is transportation; so are trucking, freight, couriers, airlines, shipping and logistics). For "exclude", do the same for the
-unwanted kind. Take nothing that is merely related. Use an empty list when that side was not asked for.
+Reply with ONE JSON object: {{"include": [...], "exclude": [...]}}. Copy names exactly from the list. Use an empty list for a
+side that was not asked for.
+
+The test for each industry: would a typical company filed under it BE the kind of business described? If yes, take it. Take
+the narrow names and the umbrella names that say the same thing, old wording and new. For transportation that means taxis,
+buses, trucking, freight, couriers, airlines, rail, shipping lines and the umbrella "transportation" categories.
+
+Leave out anything that is only next to it:
+- businesses that serve or supply that kind (warehousing and storage, equipment makers, vehicle manufacturing, software for it)
+- government bodies and public programs about it
+- postal services, unless mail was asked for
+- industries that share a word but are a different business (aerospace manufacturing is not an airline)
+When unsure, leave it out: a missing industry is easy to add by hand, a wrong one brings the wrong companies.
 
 INDUSTRIES:
 {names}"""
