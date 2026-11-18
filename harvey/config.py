@@ -587,6 +587,10 @@ class UsageConfig(BaseModel):
     max_daily_claude_percent: float = 80.0
     heartbeat_interval_minutes: int = 15
     quiet_hours: QuietHoursConfig = QuietHoursConfig()
+    # Whether Harvey looks for new prospects on the web by itself when it has
+    # nobody to write to. Turn it off when you bring your own people (SalesQL,
+    # an import): Harvey then only writes to, and answers, the contacts it has.
+    auto_prospect: bool = True
 
     @field_validator("max_daily_claude_percent")
     @classmethod
@@ -1025,6 +1029,151 @@ def _with_approval_line(raw: str, word: str) -> list[str]:
             break
         out.append(raw[:m.end()] + f"\n{child}require_approval: {word}" + raw[m.end():])
     return out
+
+
+# The business profile: who Harvey writes as and what it is selling. Edited on
+# the dashboard (Settings > Your business) so nobody has to open a file.
+PROFILE_FIELDS = {
+    # form field: (section path, kind)
+    "sender_name": (("persona", "name"), "text"),
+    "sender_role": (("persona", "role"), "text"),
+    "sender_email": (("persona", "email"), "email"),
+    "company": (("persona", "company"), "text"),
+    "tone": (("persona", "tone"), "text"),
+    "product_name": (("product", "name"), "text"),
+    "product_description": (("product", "description"), "long"),
+    "pricing": (("product", "pricing"), "long"),
+    "key_benefits": (("product", "key_benefits"), "lines"),
+    "offer_primary": (("product", "offer", "primary"), "text"),
+    "offer_entry": (("product", "offer", "entry"), "text"),
+    "goal": (("product", "offer", "goal"), ("book_call", "start_trial", "get_reply")),
+    "booking_method": (("product", "offer", "booking_method"),
+                       ("calendar_link", "suggest_times", "ask_preference")),
+    "booking_url": (("product", "offer", "booking_url"), "url"),
+    "meeting_duration": (("product", "offer", "meeting_duration"), "text"),
+    "meeting_owner": (("product", "offer", "meeting_owner"), "text"),
+    "postal_address": (("compliance", "postal_address"), "text"),
+    "auto_prospect": (("usage", "auto_prospect"), "bool"),
+}
+PROFILE_REQUIRED = ("sender_name", "sender_email", "company", "product_name",
+                    "product_description")
+_PLACEHOLDERS = {"your company", "your product", "harvey@yourcompany.com",
+                 "describe what your product does and who it's for", "starting at $x/mo",
+                 "benefit 1", "benefit 2", "benefit 3"}
+
+
+def _dig(data: dict, path: tuple):
+    for key in path:
+        data = data.get(key) if isinstance(data, dict) else None
+    return data
+
+
+def business_profile(path=None) -> dict:
+    """The profile as the form shows it. Template placeholders come back
+    empty, so the form asks for them instead of showing "Your Company"."""
+    try:
+        data = yaml.safe_load(read_user_text(path or _find_config_file()))
+    except Exception:
+        data = {}
+    out = {}
+    for field, (where, kind) in PROFILE_FIELDS.items():
+        value = _dig(data if isinstance(data, dict) else {}, where)
+        if kind == "bool":
+            value = value is not False       # absent means the default, on
+        elif kind == "lines":
+            value = [v for v in value if isinstance(v, str)
+                     and v.strip().lower() not in _PLACEHOLDERS] if isinstance(value, list) else []
+        else:
+            value = value.strip() if isinstance(value, str) else ""
+            if value.lower() in _PLACEHOLDERS:
+                value = ""
+        out[field] = value
+    out["complete"] = all(out[f] for f in PROFILE_REQUIRED)
+    return out
+
+
+def set_business_profile(values: dict, source=None, target=None) -> Path:
+    """Save the profile into harvey.local.yaml (created from the config in
+    use when it doesn't exist yet). Everything else in the config is kept.
+    Raises ConfigError with a message for the person filling in the form."""
+    if not isinstance(values, dict):
+        raise ConfigError("Send the profile as JSON.")
+    source = Path(source or _find_config_file())
+    target = Path(target or (source if source.name == "harvey.local.yaml"
+                             else PROJECT_ROOT / "harvey.local.yaml"))
+    try:
+        data = yaml.safe_load(read_user_text(source))
+    except (OSError, yaml.YAMLError) as e:
+        raise ConfigError(f"Could not read {source.name}: {e}")
+    if not isinstance(data, dict):
+        raise ConfigError(f"{source.name} isn't a settings file Harvey can read.")
+    clean = {}
+    for field, (where, kind) in PROFILE_FIELDS.items():
+        if field not in values:
+            continue
+        raw = values[field]
+        label = field.replace("_", " ").capitalize()
+        if kind == "bool":
+            if not isinstance(raw, bool):
+                raise ConfigError(f"{label} must be on or off.")
+            clean[field] = raw
+            continue
+        if kind == "lines":
+            if not isinstance(raw, list) or len(raw) > 12 \
+                    or not all(isinstance(v, str) and len(v) <= 300 for v in raw):
+                raise ConfigError(f"{label}: up to 12 lines of at most 300 characters each.")
+            clean[field] = [re.sub(r"\s+", " ", v).strip() for v in raw if v.strip()]
+            continue
+        if not isinstance(raw, str):
+            raise ConfigError(f"{label} must be text.")
+        text = raw.strip() if kind == "long" else re.sub(r"\s+", " ", raw).strip()
+        if len(text) > (2000 if kind == "long" else 300):
+            raise ConfigError(f"{label} is too long.")
+        if isinstance(kind, tuple) and text not in kind:
+            raise ConfigError(f"{label} must be one of: {', '.join(kind)}.")
+        if kind == "email" and text and not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", text):
+            raise ConfigError(f"{label} doesn't look like an email address.")
+        if kind == "url" and text and not re.match(r"^https://[^\s]+$", text):
+            raise ConfigError(f"{label} must be a link starting with https://")
+        clean[field] = text
+    merged = {**{f: v for f, v in business_profile(source).items() if f != "complete"}, **clean}
+    missing = [f.replace("_", " ") for f in PROFILE_REQUIRED if not merged.get(f)]
+    if missing:
+        raise ConfigError("Still needed: " + ", ".join(missing) + ".")
+    if merged["booking_method"] == "calendar_link" and not merged["booking_url"]:
+        raise ConfigError("Give the booking link, or choose another way to book a meeting.")
+    for field, value in merged.items():
+        where = PROFILE_FIELDS[field][0]
+        node = data
+        for key in where[:-1]:
+            if not isinstance(node.get(key), dict):
+                node[key] = {}
+            node = node[key]
+        node[where[-1]] = value
+    # The template's example answers to objections would be sent as if they
+    # were this business's own. Drop them unless they were rewritten.
+    persona = data.get("persona")
+    if isinstance(persona, dict) and "yourcompany" in str(persona.get("linkedin") or ""):
+        persona["linkedin"] = ""
+    answers = (data.get("product") or {}).get("objection_responses")
+    if isinstance(answers, dict) and any("most of our clients see roi" in str(v).lower()
+                                         for v in answers.values()):
+        data["product"]["objection_responses"] = {}
+    try:
+        HarveyConfig(**data)
+    except ValidationError as e:
+        raise ConfigError(f"That can't be saved:\n{_format_validation_error(e)}")
+    text = ("# Harvey's settings for this business. Written by the dashboard (Settings > Your business);\n"
+            "# this file wins over harvey.yaml. Edit it there or here.\n\n"
+            + yaml.safe_dump(data, sort_keys=False, allow_unicode=True, width=100))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return target
 
 
 def set_require_approval(value: bool, path=None) -> Path:
