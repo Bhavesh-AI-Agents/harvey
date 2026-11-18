@@ -815,12 +815,12 @@ async def salesql_overview():
         if title and len(title) <= 60:
             seen[title] = seen.get(title, 0) + 1
     out["titles_seen"] = [t for t, _ in sorted(seen.items(), key=lambda x: (-x[1], x[0]))[:30]]
-    # Each audience has its own list of people. Those found before audiences
-    # existed, or whose audience was deleted, join the one in use.
-    active = (out.get("audiences") or {}).get("active") or ""
-    if active:
-        await state.adopt_salesql_candidates(active)
-    scope = active if (out.get("audiences") or {}).get("saved") else None
+    # Each audience has its own list of people. With none saved, the list is
+    # the people found before audiences were used (and empty after that).
+    shown = out.get("audiences") or {}
+    scope = shown.get("active") or ""
+    if not shown.get("saved") and await state.get_setting(collector.USED_KEY, ""):
+        await state.delete_salesql_candidates("", "found")      # left over from deleted audiences
     out["candidates"] = [_salesql_row(r) for r in await state.get_salesql_candidates(
         status="found", audience_id=scope)]
     out["handled"] = [_salesql_row(r) for r in await state.get_salesql_candidates(
@@ -1073,6 +1073,21 @@ async def salesql_audience_delete(request: Request):
         return JSONResponse({"success": False, "message": str(e)}, status_code=400)
     await state.log_action("salesql_audience", "dashboard", {"deleted": data.get("id")})
     return {"success": True}
+
+
+@app.post("/api/salesql/qualify")
+async def salesql_qualify(request: Request):
+    """Move ticked people to Qualified on the operator's say-so. Spends nothing."""
+    from harvey.collectors import salesql as collector
+    data = await _json_body(request)
+    ids = data.get("ids")
+    if not isinstance(ids, list) or not ids or len(ids) > 500 \
+            or not all(isinstance(i, str) and 0 < len(i) <= 64 for i in ids):
+        return JSONResponse({"success": False, "message": "Tick at least one person."},
+                            status_code=400)
+    state = _state()
+    await state.init_db()
+    return {"success": True, "moved": await collector.qualify_by_hand(state, ids)}
 
 
 @app.post("/api/salesql/dismiss")
