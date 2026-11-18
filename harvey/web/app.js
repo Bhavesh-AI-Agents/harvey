@@ -1430,7 +1430,17 @@ async function loadBusiness() {
     fields.forEach(([key, label, kind, hint]) => {
       const value = data[key];
       html += '<div class="form-group"><label class="form-label" for="biz-' + key + '">' + label + '</label>';
-      if (typeof kind === 'object') {
+      const boxes = key === 'sender_email' ? (data.mailboxes || []) : [];
+      if (boxes.length) {
+        // Connected mailboxes exist: the sender is one of them, never free text.
+        const known = boxes.some(b => b.toLowerCase() === String(value || '').toLowerCase());
+        html += '<select class="form-input" id="biz-' + key + '">' +
+          (known ? '' : '<option value="" selected>Choose a connected mailbox</option>') +
+          boxes.map(b => '<option value="' + escHtml(b) + '"' +
+            (b.toLowerCase() === String(value || '').toLowerCase() ? ' selected' : '') + '>' + escHtml(b) + '</option>').join('') +
+          '</select>' + (!known && value ? '<p class="desc" style="margin:6px 0 0">Saved now: ' + escHtml(value) +
+            ', which is not a connected sending mailbox. Pick one and save.</p>' : '');
+      } else if (typeof kind === 'object') {
         html += '<select class="form-input" id="biz-' + key + '">' + Object.keys(kind).map(k =>
           '<option value="' + k + '"' + (k === value ? ' selected' : '') + '>' + escHtml(kind[k]) + '</option>').join('') + '</select>';
       } else if (kind === 'area' || kind === 'lines') {

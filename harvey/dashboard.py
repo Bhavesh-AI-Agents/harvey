@@ -353,11 +353,22 @@ def _current_provider() -> str:
         return "instantly"
 
 
+def _mailbox_addresses() -> list[str]:
+    """The connected sending mailboxes, for the sender-email choice."""
+    try:
+        from harvey import mailboxes
+        return [box.address for box in mailboxes.load()]
+    except Exception:
+        return []
+
+
 @app.get("/api/business")
 async def business_get():
     """Who Harvey writes as and what it sells, as the Settings form shows it."""
     from harvey.config import business_profile
-    return business_profile()
+    profile = business_profile()
+    profile["mailboxes"] = _mailbox_addresses()
+    return profile
 
 
 @app.post("/api/business")
@@ -368,6 +379,12 @@ async def business_save(request: Request):
         data = await request.json()
     except Exception:
         data = None
+    boxes = _mailbox_addresses()
+    chosen = str((data or {}).get("sender_email") or "").strip().lower() if isinstance(data, dict) else ""
+    if boxes and chosen and chosen not in [b.lower() for b in boxes]:
+        return JSONResponse({"success": False, "message":
+                             "Your email address must be one of the connected sending mailboxes: "
+                             + ", ".join(boxes) + "."}, status_code=400)
     try:
         path = set_business_profile(data)
     except ConfigError as e:
