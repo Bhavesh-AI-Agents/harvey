@@ -101,6 +101,7 @@ class Brain:
         # rate limit or timeout), as opposed to a reply that wasn't valid
         # JSON. Callers that count model failures must not count outages.
         self.last_reply_empty = False
+        self.last_error = ""   # why the last call got no reply (command provider)
         # Codex health (unused for Claude, whose behaviour is unchanged).
         self.unavailable = ""
         self._unavailable_at = 0.0
@@ -452,6 +453,7 @@ class Brain:
         for. A non-zero exit or empty output is a failed call.
         """
         problem = self._command_problem()
+        self.last_error = problem
         if problem:
             logger.error(f"Model call not sent: {problem}")
             return ""
@@ -527,6 +529,8 @@ class Brain:
                         pass
         logger.error(f"Model command failed after {max_retries + 1} attempts. "
                      f"Last error: {last_error[:200]}")
+        # What the program said, for whoever is waiting on this call.
+        self.last_error = last_error[:300]
         return ""
 
     async def _think_codex(

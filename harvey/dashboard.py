@@ -1013,12 +1013,15 @@ async def salesql_describe(request: Request):
                 if not answer:
                     why = ""
                     try:
-                        why = brain.paused_reason() or ""
+                        why = brain.paused_reason or getattr(brain, "last_error", "") or ""
                     except Exception:
                         pass
+                    if why:
+                        raise ValueError(f"Harvey's model didn't answer: {why} "
+                                         "You can still set the filters by hand.")
                     raise ValueError(
-                        "Harvey's model didn't answer" + (f" ({why})" if why else "") + ". On the "
-                        "machine Harvey runs on, 'harvey status --check' says what is wrong. "
+                        "Harvey's model didn't answer. On the machine Harvey runs on, "
+                        "'harvey status --check' says what is wrong. "
                         "You can still set the filters by hand.")
                 return brain._extract_json(answer)
 
