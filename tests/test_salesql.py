@@ -1024,4 +1024,110 @@ async def test_each_audience_keeps_its_own_list_of_people(state):
     theirs = {r["id"] for r in await state.get_salesql_candidates(audience_id=first)}
     assert "p-ben" in mine and theirs == {"p-ada"}        # waiting people moved; the revealed one stayed
     await collector.delete_audience(state, second)
-    assert "p-ben" in {r["id"] for r in await state.get_salesql_candidates(audience_id="")}
+    left = {r["id"]: r for r in await state.get_salesql_candidates()}
+    assert "p-ben" not in left and set(left) == {"p-ada"}       # its waiting people went with it
+    await collector.delete_audience(state, first)
+    assert set(r["id"] for r in await state.get_salesql_candidates()) == {"p-ada"}   # revealed: kept
+    shown = await collector.list_audiences(state, config)
+    assert shown["saved"] is False and shown["audience"]["job_titles"]["include"] == []   # a clean start
+    third = await collector.save_audience(state, audience(name="Third"))
+    assert await state.get_salesql_candidates(audience_id=third) == []    # nothing inherited
+
+
+def two_step(first, second):
+    """A model that answers the description, then the industry question."""
+    prompts = []
+
+    async def think(prompt):
+        prompts.append(prompt)
+        return second if prompt.startswith("A salesperson described") else first
+    think.prompts = prompts
+    return think
+
+
+async def _industry_list(state, names):
+    await state.set_setting(collector._catalog_key("industry"), json.dumps(
+        {"values": {n: "v" for n in names}, "pending": []}))
+
+
+@pytest.mark.asyncio
+async def test_industries_are_chosen_by_meaning_from_salesqls_list(state):
+    names = ["Taxi and Limousine Services", "Truck Transportation", "Transportation/Trucking/Railroad",
+             "Airlines/Aviation", "Software Development", "Retail"] + [f"Filler {i}" for i in range(60)]
+    await _industry_list(state, names)
+    think = two_step(
+        {"job_titles": {"include": ["Founder"]}, "industries": {"include": ["Transportation"],
+                                                               "exclude": ["software"]}},
+        {"include": ["taxi and limousine services", "Truck Transportation", "Airlines/Aviation",
+                     "Transportation/Trucking/Railroad", "Made Up Industry"],
+         "exclude": ["Software Development", "Truck Transportation"]})
+    out = await collector.audience_from_text(state, think, "Founders of transportation businesses")
+    assert out["audience"]["industries"]["include"] == [
+        "Taxi and Limousine Services", "Truck Transportation", "Airlines/Aviation",
+        "Transportation/Trucking/Railroad"]
+    assert out["audience"]["industries"]["exclude"] == ["Software Development"]
+    assert len(think.prompts) == 2 and "Taxi and Limousine Services" in think.prompts[1]
+    assert "Taxi and Limousine Services" not in think.prompts[0]        # the first stays short
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("second", [None, {"include": []}, {"include": ["Not On The List"]}, "x"])
+async def test_an_unusable_industry_answer_falls_back_to_matching_by_name(state, second):
+    names = ["Truck Transportation", "Transportation/Trucking/Railroad", "Retail"] + [
+        f"Transportation Kind {i}" for i in range(20)] + [f"Filler {i}" for i in range(40)]
+    await _industry_list(state, names)
+    think = two_step({"job_titles": {"include": ["Founder"]},
+                      "industries": {"include": ["Transportation"]}}, second)
+    out = await collector.audience_from_text(state, think, "Founders of transportation businesses")
+    chosen = out["audience"]["industries"]["include"]
+    assert "Transportation/Trucking/Railroad" in chosen and len(chosen) == 22    # none cut off at 8
+
+
+@pytest.mark.asyncio
+async def test_no_second_question_when_no_industry_was_asked_for(state):
+    await _industry_list(state, [f"Filler {i}" for i in range(60)])
+    think = two_step({"job_titles": {"include": ["Founder"]}}, {"include": ["Filler 1"]})
+    await collector.audience_from_text(state, think, "Founders in California")
+    assert len(think.prompts) == 1
+
+
+@pytest.mark.asyncio
+async def test_people_qualified_by_hand_stay_qualified(state):
+    await collector.save_audience(state, audience(
+        industries={"include": ["Financial Services"], "exclude": []}))
+    await state.set_setting("salesql:lookup:industry:financial services", "financial-services")
+    fake = FakeSalesQL()
+    await collector.search(state, make_config(), KEY, transport=fake.transport)
+    rows = {r["id"]: r for r in await state.get_salesql_candidates()}
+    assert rows["p-eve"]["grade"] == "unsure"
+    assert await collector.qualify_by_hand(state, ["p-eve", "p-missing"]) == 1
+    row = (await state.get_salesql_candidates(ids=["p-eve"]))[0]
+    assert row["grade"] == "qualified" and row["reason"].startswith("Qualified by you. Harvey had said:")
+    await collector.save_audience(state, audience(
+        job_titles={"include": ["President"], "exclude": []}), row["audience_id"])
+    await state.update_salesql_candidate("p-ada", grade="qualified", reason="x")
+    empty = FakeSalesQL()
+    empty._result = lambda name, args, o=empty._result: (
+        {"results": [], "total": 0} if name == "search_people" else o(name, args))
+    await collector.search(state, make_config(), KEY, transport=empty.transport)
+    after = {r["id"]: r["grade"] for r in await state.get_salesql_candidates()}
+    assert after["p-eve"] == "qualified" and after["p-ada"] == "unsure"   # only the hand-picked one stays
+
+
+@pytest.mark.asyncio
+async def test_widening_an_audience_brings_earlier_people_back_to_qualified(state):
+    aid = await collector.save_audience(state, audience(
+        industries={"include": ["Retail"], "exclude": []}))
+    await state.set_setting("salesql:lookup:industry:retail", "retail")
+    await state.set_setting("salesql:lookup:industry:financial services", "financial-services")
+    fake = FakeSalesQL()
+    await collector.search(state, make_config(), KEY, transport=fake.transport)
+    assert (await state.get_salesql_candidates(ids=["p-ada"]))[0]["grade"] == "unsure"   # Financial Services
+    await collector.save_audience(state, audience(
+        industries={"include": ["Retail", "Financial Services"], "exclude": []}), aid)
+    empty = FakeSalesQL()
+    empty._result = lambda name, args, o=empty._result: (
+        {"results": [], "total": 0} if name == "search_people" else o(name, args))
+    out = await collector.search(state, make_config(), KEY, transport=empty.transport)
+    assert (await state.get_salesql_candidates(ids=["p-ada"]))[0]["grade"] == "qualified"
+    assert any("now fit this audience" in n for n in out["notes"])

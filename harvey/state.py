@@ -2273,6 +2273,17 @@ class StateManager:
             await db.commit()
         return not existed
 
+    async def delete_salesql_candidates(self, audience_id: str, status: str = "found") -> int:
+        """Forget the people on one audience's list who are in ``status``.
+        Nothing was spent on someone still waiting, and a search can find
+        them again."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                "DELETE FROM salesql_candidates WHERE audience_id = ? AND status = ?",
+                (audience_id, status))
+            await db.commit()
+            return cur.rowcount or 0
+
     async def adopt_salesql_candidates(self, audience_id: str) -> int:
         """Give people found before audiences existed to ``audience_id``."""
         async with self._connect() as db:

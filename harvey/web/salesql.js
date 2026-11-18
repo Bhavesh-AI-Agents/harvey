@@ -593,7 +593,10 @@ function sqNewAudience() {
 }
 
 async function sqDeleteAudience() {
-  if (!SQ.audId || !confirm('Delete the audience "' + SQ.aud.name + '"? People already found stay on the list.')) return;
+  const waiting = (SQ.data.candidates || []).length;
+  if (!SQ.audId || !confirm('Delete the audience "' + SQ.aud.name + '"' +
+      (waiting ? ' and the ' + waiting + ' people waiting on its list' : '') +
+      '? Anyone you already revealed stays in Contacts.')) return;
   const data = await sqPost('/api/salesql/audience/delete', {id: SQ.audId});
   if (!data || !data.success) { showToast((data && data.message) || 'Could not delete it.', 'error'); return; }
   SQ.dirty = false; SQ.aud = null; SQ.notes = [];
@@ -665,6 +668,8 @@ function sqResults() {
 function sqActions() {
   const n = SQ.picks.size;
   return '<span class="sq-actions-n">' + (n ? n + ' selected' : 'Tick people to act on them') + '</span>' +
+    (SQ.tab === 'qualified' ? '' : '<button class="btn btn-secondary" onclick="sqQualify()"' + (n && !SQ.busy ? '' : ' disabled') +
+      ' title="You vouch for them: they move to Qualified and stay there">Move to Qualified</button>') +
     '<button class="btn btn-secondary" onclick="sqDismiss()"' + (n && !SQ.busy ? '' : ' disabled') + '>Take off the list</button>' +
     '<button class="btn btn-primary" onclick="sqReveal()"' + (n && !SQ.busy ? '' : ' disabled') + '>' +
     (SQ.busy === 'reveal' ? 'Revealing…' : n ? 'Reveal ' + n + ' (' + n + (n === 1 ? ' credit' : ' credits') + ' at most)' : 'Reveal') + '</button>';
@@ -738,6 +743,16 @@ async function sqReveal() {
     : (data && data.message) || 'The reveal failed.', data && data.success ? 'success' : 'error');
   SQ.picks = new Set();
   if (data && data.success && data.revealed) SQ.tab = 'done';
+  await loadSalesql();
+}
+
+async function sqQualify() {
+  const ids = [...SQ.picks];
+  if (SQ.busy || !ids.length) return;
+  const data = await sqPost('/api/salesql/qualify', {ids: ids});
+  showToast(data && data.success ? data.moved + ' moved to Qualified.' : (data && data.message) || 'Could not do that.',
+            data && data.success ? 'success' : 'error');
+  SQ.picks = new Set();
   await loadSalesql();
 }
 

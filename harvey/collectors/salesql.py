@@ -423,6 +423,7 @@ def _l(x) -> list:
 # above, so there is one engine and the audience is only its front.
 
 AUDIENCES_KEY = "salesql:audiences"
+USED_KEY = "salesql:audiences_used"     # set once any audience has been saved
 MAX_AUDIENCES = 30
 PAIR_FIELDS = ("job_titles", "past_titles", "profile_words", "countries", "states", "cities",
                "industries", "company_types", "company_keywords")
@@ -555,6 +556,18 @@ def audience_to_engine(aud: dict) -> tuple[dict, list[dict]]:
     return settings, clean_rules(rules)
 
 
+def blank_audience() -> dict:
+    """An audience with nothing chosen yet."""
+    aud: dict = {"name": "New audience", "company_sizes": [], "page_size": 100, "staff": []}
+    for field in PAIR_FIELDS:
+        aud[field] = {"include": [], "exclude": []}
+    for field in FLAG_FIELDS:
+        aud[field] = False
+    for field in RANGE_FIELDS:
+        aud[field] = {"min": None, "max": None}
+    return aud
+
+
 async def audience_from_legacy(state, config) -> dict:
     """The audience that the settings and rules in force describe: the
     starting point shown before any audience has been saved."""
@@ -651,7 +664,7 @@ def _match_names(names: list[str], known: list[str], complete: bool, word: str,
             found = [by_lower[key]]
         else:
             pattern = re.compile(r"(?<![a-z])" + re.escape(key) + r"(?![a-z])")
-            found = [v for v in known if pattern.search(v.lower())][:8] if len(key) >= 4 else []
+            found = [v for v in known if pattern.search(v.lower())][:40] if len(key) >= 4 else []
             if not found:
                 close = difflib.get_close_matches(key, list(by_lower), n=1, cutoff=0.82)
                 found = [by_lower[close[0]]] if close else []
@@ -661,6 +674,46 @@ def _match_names(names: list[str], known: list[str], complete: bool, word: str,
             notes.append(f"Left out {word} \"{name}\": it isn't in SalesQL's list.")
         elif name not in out:
             out.append(name)
+    return out
+
+
+PICK_PROMPT = """A salesperson described the companies they want to reach. Choose the industries that fit from the list.
+
+They want companies in: {include}
+They do not want companies in: {exclude}
+
+Reply with ONE JSON object: {{"include": [...], "exclude": [...]}}. Copy names exactly from the list. For "include", take every
+industry a company of the wanted kind could be filed under, the broad ones and the narrow ones, old names and new (a taxi firm
+is transportation; so are trucking, freight, couriers, airlines, shipping and logistics). For "exclude", do the same for the
+unwanted kind. Take nothing that is merely related. Use an empty list when that side was not asked for.
+
+INDUSTRIES:
+{names}"""
+
+
+async def _pick_industries(think_json, known: list[str], include: list[str],
+                           exclude: list[str]) -> dict | None:
+    """Ask the model which of SalesQL's industries fit what was described.
+    None when the answer can't be used, so the caller falls back to matching
+    by name."""
+    try:
+        raw = await think_json(PICK_PROMPT.format(
+            include=", ".join(include) or "(nothing said)",
+            exclude=", ".join(exclude) or "(nothing said)", names="\n".join(known)))
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    by_lower = {v.lower(): v for v in known}
+    out = {}
+    for side, asked in (("include", include), ("exclude", exclude)):
+        values = raw.get(side) if isinstance(raw.get(side), list) else []
+        picked = [by_lower[v.strip().lower()] for v in values
+                  if isinstance(v, str) and v.strip().lower() in by_lower]
+        out[side] = list(dict.fromkeys(picked))[:60] if asked else []
+        if asked and not out[side]:
+            return None
+    out["exclude"] = [v for v in out["exclude"] if v not in out["include"]]
     return out
 
 
@@ -698,7 +751,18 @@ async def audience_from_text(state, think_json, text: str, *, page_size: int = 1
         lowered = {v.strip().lower() for v in include}
         draft[field] = {"include": include,
                         "exclude": [v for v in exclude if v.strip().lower() not in lowered]}
+    # Industries are a matter of meaning, not spelling: "transportation" must
+    # also bring taxis, trucking and couriers. When SalesQL's list is known,
+    # the model picks from it in a second, separate question.
+    picked = None
+    asked = draft["industries"]
+    if (asked["include"] or asked["exclude"]) and len(lists["industry"]["values"]) >= 50:
+        picked = await _pick_industries(think_json, lists["industry"]["values"],
+                                        asked["include"], asked["exclude"])
     for field, (kind, _, word) in LOOKUP_FIELDS.items():
+        if field == "industries" and picked is not None:
+            draft[field] = picked
+            continue
         taken: list[str] = []
         for side in ("include", "exclude"):
             matched = _match_names(draft[field][side], lists[kind]["values"],
@@ -752,8 +816,13 @@ async def list_audiences(state, config) -> dict:
     "saved": whether any audience has been saved}."""
     data = await _audiences(state)
     if not data["items"]:
+        # Before audiences were ever used, the form starts from harvey.yaml.
+        # After the last one is deleted it starts empty: the operator cleared
+        # it, and the file's values are not what they were working with.
+        used = bool(await state.get_setting(USED_KEY, ""))
         return {"active": "", "items": [], "saved": False,
-                "audience": await audience_from_legacy(state, config)}
+                "audience": blank_audience() if used
+                else await audience_from_legacy(state, config)}
     return {"active": data["active"], "saved": True,
             "items": [{"id": k, "name": v["name"]} for k, v in data["items"].items()],
             "audience": data["items"][data["active"]]}
@@ -771,13 +840,13 @@ async def save_audience(state, audience, audience_id: str = "") -> str:
     taken = {v["name"].lower() for k, v in data["items"].items() if k != audience_id}
     if clean["name"].lower() in taken:
         raise ValueError(f"Another audience is already called \"{clean['name']}\".")
-    first = not data["items"]
     data["items"][audience_id] = clean
     data["active"] = audience_id
     await state.set_setting(AUDIENCES_KEY, json.dumps(data))
-    if first:
-        # People found before audiences existed belong to the first one.
+    if not await state.get_setting(USED_KEY, ""):
+        # People found before audiences existed belong to the first one ever saved.
         await state.adopt_salesql_candidates(audience_id)
+        await state.set_setting(USED_KEY, "1")
     return audience_id
 
 
@@ -797,10 +866,10 @@ async def delete_audience(state, audience_id: str) -> None:
     if data["active"] == audience_id:
         data["active"] = next(iter(data["items"]), "")
     await state.set_setting(AUDIENCES_KEY, json.dumps(data))
-    # Its people are kept: those still waiting go back to no audience, and
-    # join whichever audience is used next. Nobody already revealed is lost.
-    for row in await state.get_salesql_candidates(audience_id=audience_id, limit=5000):
-        await state.update_salesql_candidate(row["id"], audience_id="")
+    # Its list goes with it: people still waiting are forgotten (nothing was
+    # spent on them and a search can find them again). Anyone already
+    # revealed is a contact and stays in Contacts.
+    await state.delete_salesql_candidates(audience_id, "found")
 
 
 async def active_audience_id(state) -> str:
@@ -1029,14 +1098,24 @@ async def search(state, config, api_key: str, *, transport=None) -> dict:
     # as that needs no new lookup: someone a changed or stricter audience no
     # longer fits should not stay under Qualified.
     seen = {p["id"] for p in people}
-    moved = 0
+    moved = back = 0
     for row in await state.get_salesql_candidates(status="found", audience_id=audience_id):
-        if row["id"] in seen or row["grade"] != "qualified":
+        if row["id"] in seen or (row["reason"] or "").startswith(BY_HAND):
+            continue
+        # Someone marked Unsure or Rejected can be judged again only when no
+        # company check is involved: Harvey kept no result of those to reuse.
+        if row["grade"] != "qualified" and staff_rules:
             continue
         grade, reason = grade_by_rules(row, rules, allowed_sizes=sizes, staff={})
-        if grade != "qualified":
-            await state.update_salesql_candidate(row["id"], grade=grade, reason=reason)
+        if grade == row["grade"]:
+            continue
+        await state.update_salesql_candidate(row["id"], grade=grade, reason=reason)
+        if row["grade"] == "qualified":
             moved += 1
+        elif grade == "qualified":
+            back += 1
+    if back:
+        notes.append(f"{back} found earlier now fit this audience and moved to Qualified.")
     if moved:
         notes.append(f"{moved} found earlier no longer fit this audience and left Qualified.")
     await state.log_action("salesql_search", "scout", {
@@ -1278,6 +1357,23 @@ async def _with_search_settings(state, config):
     """``config`` with the dashboard's search settings laid over salesql.*."""
     values = await search_settings(state, config)
     return config.model_copy(update={"salesql": config.salesql.model_copy(update=values)})
+
+
+BY_HAND = "Qualified by you."
+
+
+async def qualify_by_hand(state, candidate_ids: list[str]) -> int:
+    """Move people the operator vouches for to Qualified. They stay there:
+    a later search does not judge them again."""
+    moved = 0
+    for row in await state.get_salesql_candidates(ids=list(dict.fromkeys(candidate_ids))):
+        if row["status"] != "found" or row["grade"] == "qualified":
+            continue
+        was = (row["reason"] or "").strip()
+        await state.update_salesql_candidate(
+            row["id"], grade="qualified", reason=BY_HAND + (f" Harvey had said: {was}" if was else ""))
+        moved += 1
+    return moved
 
 
 CAP_KEY = "salesql:max_reveals_per_day"
