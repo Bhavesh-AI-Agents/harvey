@@ -942,8 +942,8 @@ def cmd_salesql(args):
                          if account["credits_refresh_date"] else ""))
                 print(f"  SalesQL's daily limits: {account['searches_per_day']} searches, "
                       f"{account['reveals_per_day']} reveals")
-                print(f"  Harvey's cap: {left} of {config.salesql.max_reveals_per_day} "
-                      "reveals left today")
+                print(f"  Harvey's cap: {left} of {await collector.daily_cap(state, config)} "
+                      "reveals left today (change it on the dashboard's Discover tab)")
                 print(f"  People found and not yet revealed: {waiting}\n")
                 return 0
             if action == "search":
