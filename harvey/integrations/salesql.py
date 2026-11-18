@@ -304,6 +304,20 @@ class SalesQL:
         return out
 
 
+    async def verify_email(self, email: str) -> str:
+        """Ask SalesQL whether one address accepts mail: "valid", "invalid",
+        "catch_all" or "unknown". SPENDS ONE VERIFICATION CREDIT, a balance
+        separate from the reveal credits (plans include a monthly allowance).
+        The check can take up to 45 seconds. Never repeat a failed call at
+        once: it may have completed and been charged."""
+        data = _dict(await self._tool("verify_email", {"params": {"email": email}}))
+        for key in ("result", "data"):
+            if isinstance(data.get(key), dict):
+                data = data[key]
+                break
+        status = _str(data.get("status")).lower().replace("-", "_")
+        return status if status in ("valid", "invalid", "catch_all") else "unknown"
+
 def key_from_env() -> str:
     import os
     return os.getenv("SALESQL_API_KEY", "").strip()
