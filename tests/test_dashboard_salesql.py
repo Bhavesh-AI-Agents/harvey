@@ -202,7 +202,7 @@ def test_describing_an_audience_asks_the_model_and_saves_nothing(client, monkeyp
     assert r.status_code == 200
     body = r.json()
     assert body["audience"]["name"] == "Shop owners" and body["audience"]["company_sizes"] == ["1-10"]
-    assert calls and calls[0]["task"] == "salesql_audience" and calls[0]["max_retries"] == 1
+    assert calls and calls[0]["task"] == "salesql_audience" and calls[0]["max_retries"] == 0 and calls[0]["timeout"] == 300
     assert client.get("/api/salesql").json()["audiences"]["saved"] is False
 
 

@@ -1008,7 +1008,7 @@ async def salesql_describe(request: Request):
             async def think(prompt: str):
                 answer = await brain.think(
                     prompt + "\n\nRespond ONLY with valid JSON. No markdown, no explanation.",
-                    expect_json=True, timeout=120, max_retries=1,
+                    expect_json=True, timeout=300, max_retries=0,
                     agent="scout", task="salesql_audience")
                 if not answer:
                     why = ""
