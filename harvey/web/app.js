@@ -380,12 +380,33 @@ async function downloadCsv(path, filename, btn) {
   }
 }
 
+// Messages stack bottom-right. An error stays until it is closed, so it can
+// be read, copied or screenshotted; anything else leaves by itself.
 function showToast(msg, type) {
+  let stack = document.getElementById('toasts');
+  if (!stack) {
+    stack = document.createElement('div');
+    stack.id = 'toasts';
+    stack.setAttribute('aria-live', 'polite');
+    document.body.appendChild(stack);
+  }
   const t = document.createElement('div');
   t.className = 'toast ' + type;
-  t.textContent = msg;
-  document.body.appendChild(t);
-  setTimeout(() => t.remove(), 2600);
+  t.setAttribute('role', type === 'error' ? 'alert' : 'status');
+  const text = document.createElement('span');
+  text.textContent = msg;
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'toast-close';
+  close.setAttribute('aria-label', 'Close this message');
+  close.textContent = '\u00d7';
+  close.onclick = () => t.remove();
+  t.append(text, close);
+  stack.appendChild(t);
+  while (stack.children.length > 5) stack.firstChild.remove();
+  if (type !== 'error') {
+    setTimeout(() => t.remove(), Math.min(12000, 3500 + String(msg).length * 45));
+  }
 }
 
 function toggleVisibility(inputId) {
