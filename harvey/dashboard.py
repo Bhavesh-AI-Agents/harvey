@@ -37,6 +37,17 @@ LOG_FILE = PROJECT_ROOT / "data" / "harvey.log"
 TOKEN_FILE = PROJECT_ROOT / "data" / "dashboard-token"
 
 
+def _gmail_signed_in() -> bool:
+    """A Gmail sign-in is stored: the single mailbox's, or any listed mailbox's."""
+    if (PROJECT_ROOT / "data" / "gmail_token.json").is_file():
+        return True
+    try:
+        from harvey import mailboxes as mb
+        return any(mb.token_path(b.address).is_file() for b in mb.load())
+    except Exception:
+        return False
+
+
 def _resolve_config_file() -> Path:
     """harvey.local.yaml wins when present — same resolution as config.py's
     loader, so the dashboard doesn't judge setup complete against the
@@ -213,10 +224,9 @@ async def get_setup_status():
         return all((env_vars.get(k, "") or os.getenv(k, "")).strip() for k in keys)
 
     if provider == "gmail":
-        provider_done = _has("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET") and \
-            (PROJECT_ROOT / "data" / "gmail_token.json").is_file()
-        provider_help = ("Set GMAIL_CLIENT_ID/SECRET in Settings, then run "
-                         "'harvey gmail auth' in your terminal.")
+        provider_done = _has("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET") and _gmail_signed_in()
+        provider_help = ("Save the Google client ID and secret in Settings, then add a "
+                         "mailbox under Sending mailboxes and sign it in.")
     elif provider == "microsoft":
         provider_done = _has("M365_CLIENT_ID") and \
             (PROJECT_ROOT / "data" / "m365_token.json").is_file()
@@ -359,8 +369,8 @@ async def get_settings():
     def is_set(k):
         return bool((env_vars.get(k) or "").strip())
 
-    # Gmail is authorized once harvey gmail auth has stored a token file.
-    gmail_token = (PROJECT_ROOT / "data" / "gmail_token.json").is_file()
+    # Gmail is authorized once a mailbox has signed in.
+    gmail_token = _gmail_signed_in()
 
     return {
         "provider": _current_provider(),
