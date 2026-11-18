@@ -95,3 +95,20 @@ def test_the_daily_cap_can_be_changed_here(client):
     for bad in ({"cap": -1}, {"cap": 5000}, {"cap": "60"}, {}, []):
         assert client.post("/api/salesql/cap", json=bad).status_code == 400
     assert client.get("/api/salesql").json()["cap"] == 60
+
+
+def test_search_settings_are_shown_and_saved_from_the_card(client):
+    shown = client.get("/api/salesql").json()
+    assert shown["search"]["job_titles"] and "1-10" in shown["sizes"]
+    r = client.post("/api/salesql/settings", json={
+        "job_titles": ["Owner"], "states": ["California"], "company_sizes": ["1-10"],
+        "page_size": 100, "require_no_developers": True})
+    assert r.status_code == 200 and r.json()["search"]["states"] == ["California"]
+    again = client.get("/api/salesql").json()["search"]
+    assert again["job_titles"] == ["Owner"] and again["page_size"] == 100
+
+
+def test_bad_search_settings_are_refused_with_a_reason(client):
+    r = client.post("/api/salesql/settings", json={"company_sizes": ["tiny"]})
+    assert r.status_code == 400 and "Company sizes" in r.json()["message"]
+    assert client.post("/api/salesql/settings", json={"job_titles": []}).status_code == 400

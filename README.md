@@ -753,6 +753,8 @@ salesql:
   technical_words: [engineer, developer, programmer, cto, ...]
 ```
 
+The same settings can be changed without editing the file: on the dashboard under **Discover → People, through SalesQL → Who to search for**, or with `harvey salesql settings --set '{"states": ["California"]}'` (`harvey salesql settings` prints them). Values saved that way win over the file. Pressing Search again with unchanged settings reads the next page of people.
+
 An industry filter is broad and noisy (it matches any company a person is attached to). `company_keywords` is usually sharper. Harvey never opens or scrapes linkedin.com: a LinkedIn URL is only an identifier SalesQL returns and accepts.
 
 ### Warmup with TrulyInbox

@@ -921,6 +921,22 @@ def cmd_salesql(args):
                   f"{account['credits']} credits left.\n")
             return 0
 
+        if action == "settings":
+            import json as _json
+            try:
+                config = load_config()
+            except ConfigError as e:
+                print(f"\n  {e}\n")
+                return 1
+            if args.set:
+                try:
+                    await collector.set_search_settings(state, config, _json.loads(args.set))
+                except ValueError as e:
+                    print(f"\n  {e}\n")
+                    return 1
+            print(_json.dumps(await collector.search_settings(state, config), indent=2))
+            return 0
+
         key = sq.key_from_env()
         if not key:
             print("\n  SalesQL isn't connected. Run: harvey salesql connect\n")
@@ -1277,9 +1293,11 @@ def main():
     sub = subparsers.add_parser(
         "salesql", help="Find people through SalesQL: search (free), then reveal the ones you pick")
     sub.add_argument("salesql_action", nargs="?", default="status",
-                     choices=["status", "connect", "search", "list", "reveal"],
-                     help="show the status (default), connect a key, search, list who was "
-                          "found, or reveal contacts")
+                     choices=["status", "connect", "settings", "search", "list", "reveal"],
+                     help="show the status (default), connect a key, show or change who a "
+                          "search looks for, search, list who was found, or reveal contacts")
+    sub.add_argument("--set", default="", metavar="JSON",
+                     help='settings: change them, e.g. --set \'{"states": ["California"]}\'')
     sub.add_argument("ids", nargs="*", help="reveal: ids from 'harvey salesql list'")
     sub.add_argument("--qualified", action="store_true",
                      help="reveal: everyone graded qualified")

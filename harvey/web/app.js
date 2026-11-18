@@ -1143,6 +1143,7 @@ async function loadSalesql() {
     '<button class="btn btn-secondary btn-sm" onclick="saveSalesqlCap()">Save</button></p>' +
     '<p class="desc" style="margin:6px 0 0">The cap is a safety limit on credits spent in one day. ' +
     'Plan and credits are read from SalesQL each time this card loads and before every reveal.</p>' +
+    salesqlSettingsForm(data.search, data.sizes) +
     '<div class="btn-group" style="margin-top:12px">' +
     '<button class="btn btn-secondary" id="salesql-search" onclick="searchSalesql()"' +
     (_salesqlBusy ? ' disabled' : '') + '>Search (free)</button>' +
@@ -1151,8 +1152,7 @@ async function loadSalesql() {
   const rows = data.candidates || [];
   if (!rows.length) {
     el.innerHTML = head + emptyState('&#128269;', 'Nobody found yet',
-      'Press <b>Search</b>. It uses the job titles, industries, company size and countries ' +
-      'in your ICP, and spends no credits.');
+      'Set <b>Who to search for</b>, then press <b>Search</b>. It spends no credits.');
     return;
   }
   const tone = {qualified: 't-good', unsure: 't-waiting', rejected: 't-bad'};
@@ -1170,6 +1170,67 @@ async function loadSalesql() {
     '</tbody></table></div>';
   el.innerHTML = head;
   countSalesqlPicks();
+}
+
+// Who a search looks for. Lists are typed with commas between entries.
+const SALESQL_LISTS = [
+  ['job_titles', 'Job titles', 'Founder, Owner, CEO'],
+  ['states', 'States or cities', 'California (empty: the whole country)'],
+  ['countries', 'Countries', 'United States'],
+  ['industries', 'Industries', 'Retail, Real Estate (empty: any industry)'],
+  ['company_keywords', 'Words in the company name',
+   'merchant services (when set, used in place of industries)'],
+];
+
+function salesqlSettingsForm(search, sizes) {
+  if (!search) return '';
+  const open = _salesqlSettingsOpen ? ' open' : '';
+  let html = '<details id="salesql-settings" style="margin-top:14px"' + open +
+    ' ontoggle="_salesqlSettingsOpen = this.open"><summary style="cursor:pointer"><b>Who to search for</b> ' +
+    '<span class="muted">' + escHtml((search.job_titles || []).slice(0, 3).join(', ')) +
+    ' &middot; ' + escHtml((search.company_sizes || []).join(', ') || 'any size') + ' employees &middot; ' +
+    escHtml((search.states || []).concat(search.states && search.states.length ? [] : search.countries || [])
+      .join(', ') || 'anywhere') + '</span></summary><div style="margin-top:12px">';
+  SALESQL_LISTS.forEach(([field, label, hint]) => {
+    html += '<div class="form-group"><label class="form-label" for="sq-' + field + '">' + label +
+      '</label><input class="form-input" id="sq-' + field + '" type="text" autocomplete="off" ' +
+      'placeholder="' + escHtml(hint) + '" value="' + escHtml((search[field] || []).join(', ')) + '"></div>';
+  });
+  html += '<div class="form-group"><span class="form-label">Company size (employees)</span><div>' +
+    (sizes || []).map(size => '<label style="display:inline-block;margin:0 14px 6px 0">' +
+      '<input type="checkbox" class="sq-size" value="' + escHtml(size) + '"' +
+      ((search.company_sizes || []).includes(size) ? ' checked' : '') + '> ' + escHtml(size) +
+      '</label>').join('') + '</div></div>' +
+    '<div class="form-group"><label><input type="checkbox" id="sq-nodevs"' +
+    (search.require_no_developers ? ' checked' : '') +
+    '> Only companies with no software staff of their own</label></div>' +
+    '<div class="form-group"><label class="form-label" for="sq-page">People per search (20 to 100)</label>' +
+    '<input class="form-input" id="sq-page" type="number" min="20" max="100" style="width:110px" value="' +
+    (search.page_size || 20) + '"></div>' +
+    '<button class="btn btn-secondary btn-sm" onclick="saveSalesqlSettings()">Save search settings</button>' +
+    '<p class="desc" style="margin:8px 0 0">Saved here, these replace the values in harvey.yaml. ' +
+    'Pressing Search again with the same settings brings the next group of people.</p></div></details>';
+  return html;
+}
+
+let _salesqlSettingsOpen = false;
+
+async function saveSalesqlSettings() {
+  const body = {};
+  SALESQL_LISTS.forEach(([field]) => {
+    const el = document.getElementById('sq-' + field);
+    if (el) body[field] = el.value.split(',').map(v => v.trim()).filter(Boolean);
+  });
+  body.company_sizes = [...document.querySelectorAll('.sq-size:checked')].map(c => c.value);
+  body.require_no_developers = !!(document.getElementById('sq-nodevs') || {}).checked;
+  body.page_size = parseInt((document.getElementById('sq-page') || {}).value, 10);
+  const data = await api('/api/salesql/settings', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+  });
+  showToast(data && data.success ? 'Search settings saved.'
+                                  : (data && data.message) || 'Could not save the settings.',
+            data && data.success ? 'success' : 'error');
+  if (data && data.success) loadSalesql();
 }
 
 function countSalesqlPicks() {
@@ -1213,7 +1274,8 @@ async function searchSalesql() {
   _salesqlBusy = false;
   showToast(data && data.success
     ? data.found + ' found: ' + data.qualified + ' qualified, ' + data.unsure + ' unsure, ' +
-      data.rejected + ' rejected. No credits spent.'
+      data.rejected + ' rejected. No credits spent.' +
+      (data.notes && data.notes.length ? ' ' + data.notes.join(' ') : '')
     : (data && data.message) || 'The search failed.', data && data.success ? 'success' : 'error');
   loadSalesql();
 }
