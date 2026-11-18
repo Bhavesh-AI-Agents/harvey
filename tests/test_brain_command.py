@@ -99,3 +99,11 @@ def test_the_environment_can_point_harvey_at_its_model(monkeypatch):
     monkeypatch.delenv("HARVEY_BRAIN_PROVIDER")
     monkeypatch.delenv("HARVEY_BRAIN_COMMAND")
     assert BrainConfig().provider == "claude"
+
+
+@pytest.mark.asyncio
+async def test_what_the_program_said_is_kept_for_the_person_waiting(state, tmp_path):
+    cmd = program(tmp_path, "sys.exit('no answer: the monthly limit is reached')")
+    brain = Brain(state, BrainConfig(provider="command", command=cmd))
+    assert await brain.think("hello", max_retries=0) == ""
+    assert "monthly limit is reached" in brain.last_error
