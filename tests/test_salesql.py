@@ -28,7 +28,7 @@ def make_config(**salesql):
                  "objection_responses": {}},
         icp={"industries": ["Financial Services"], "company_size": "2-50",
              "titles": ["Founder", "Owner"], "geography": ["US"]},
-        salesql=salesql,
+        salesql={"verify_emails": False, **salesql},
     )
 
 
@@ -68,6 +68,7 @@ class FakeSalesQL:
         self.stream = stream
         self.status = status
         self.dev_total = dev_total
+        self.verify_status = "valid"            # None: the key lacks the Verify scope
 
     def tools(self, name):
         return [args for tool, args in self.calls if tool == name]
@@ -79,6 +80,10 @@ class FakeSalesQL:
                     "credits_refresh_date": "2026-12-17T08:00:00+01:00", "banned": False,
                     "rate_limits": {"search_people": {"daily": 25},
                                     "persons/enrich": {"daily": 25}}}
+        if name == "verify_email":
+            if self.verify_status is None:
+                raise PermissionError
+            return {"email": params["email"], "status": self.verify_status}
         if name == "lookup":
             if params["type"] == "country":
                 return {"values": [{"value": US, "label": "United States"}]
@@ -125,7 +130,12 @@ class FakeSalesQL:
         else:
             name, args = body["params"]["name"], body["params"]["arguments"]
             self.calls.append((name, args))
-            result = {"content": [{"type": "text", "text": json.dumps(self._result(name, args))}]}
+            try:
+                result = {"content": [{"type": "text",
+                                       "text": json.dumps(self._result(name, args))}]}
+            except PermissionError:
+                result = {"isError": True, "content": [
+                    {"type": "text", "text": "This key lacks the verify scope."}]}
         message = {"jsonrpc": "2.0", "id": body["id"], "result": result}
         if self.stream:
             return httpx.Response(
@@ -456,3 +466,47 @@ def test_the_phone_kept_is_a_real_valid_direct_number():
         == ("+1 555 0199", True)
     assert pick({"phones": [{"phone": "+1 555 0100", "type": "Company"},
                             {"number": "+1 555 0142", "type": "Direct"}]}) == ("+1 555 0142", False)
+
+
+async def _guess(email, env=None):
+    return "guess"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer,expect", [("valid", "verified"), ("invalid", "invalid"),
+                                           ("catch_all", "risky"), ("unknown", "guess")])
+async def test_salesql_checks_an_address_harveys_verifier_could_not(state, answer, expect):
+    fake = FakeSalesQL()
+    fake.verify_status = answer
+    config = make_config(verify_emails=True)
+    await collector.search(state, config, KEY, transport=fake.transport)
+    out = await collector.reveal(state, config, KEY, ["p-ada"], verify=_guess,
+                                 transport=fake.transport)
+    assert out["verifications_used"] == 1
+    assert fake.tools("verify_email") == [{"params": {"email": "p-ada@northvale.example"}}]
+    assert (await state.get_prospect_by_email("p-ada@northvale.example")).email_status == expect
+
+
+@pytest.mark.asyncio
+async def test_no_salesql_check_when_harveys_verifier_already_answered(state):
+    fake = FakeSalesQL()
+    config = make_config(verify_emails=True)
+    await collector.search(state, config, KEY, transport=fake.transport)
+    out = await collector.reveal(state, config, KEY, ["p-ada"], verify=verified,
+                                 transport=fake.transport)
+    assert out["verifications_used"] == 0 and not fake.tools("verify_email")
+
+
+@pytest.mark.asyncio
+async def test_a_key_without_the_verify_scope_is_tried_once_and_says_so(state):
+    fake = FakeSalesQL()
+    fake.verify_status = None
+    config = make_config(verify_emails=True)
+    await collector.search(state, config, KEY, transport=fake.transport)
+    out = await collector.reveal(state, config, KEY, ["p-ada", "p-ben"], verify=_guess,
+                                 transport=fake.transport)
+    assert out["revealed"] == 2 and out["verifications_used"] == 0
+    assert len(fake.tools("verify_email")) == 1
+    assert any("Verify" in m for m in out["messages"])
+    # SalesQL's own mark still counts when its check couldn't run.
+    assert (await state.get_prospect_by_email("p-ben@lakeside.example")).email_status == "verified"

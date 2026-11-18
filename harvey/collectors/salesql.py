@@ -396,7 +396,8 @@ async def reveal(state, config, api_key: str, candidate_ids: list[str], *,
         from harvey.integrations.email_finder import verify_published_address as verify
 
     summary = {"asked": len(candidate_ids), "revealed": 0, "no_email": 0, "skipped": 0,
-               "failed": 0, "held_back": 0, "credits_used": 0, "messages": []}
+               "failed": 0, "held_back": 0, "credits_used": 0, "verifications_used": 0,
+               "messages": []}
     rows = [r for r in await state.get_salesql_candidates(ids=list(dict.fromkeys(candidate_ids)))
             if r["status"] == "found"]
     if not rows:
@@ -450,6 +451,24 @@ async def reveal(state, config, api_key: str, candidate_ids: list[str], *,
     await state.increment_setting(_usage_key(), matched)
     confirmed = await state.confirmed_signal_codes()
 
+    checker = sq.SalesQL(api_key, transport=transport)
+    try:
+        await _file_people(state, config, rows, people, summary, blocked, confirmed,
+                           verify, env, checker)
+    finally:
+        await checker.aclose()
+
+    await state.log_action("salesql_reveal", "scout", {
+        k: summary[k] for k in ("revealed", "no_email", "skipped", "failed", "credits_used",
+                                "verifications_used")})
+    return summary
+
+
+async def _file_people(state, config, rows, people, summary, blocked, confirmed,
+                       verify, env, checker):
+    """Turn each revealed profile into a prospect with a checked address."""
+    from harvey.gate import do_not_contact_match
+    salesql_checks = config.salesql.verify_emails
     for row, person in zip(rows, people):
         if not person:
             await state.update_salesql_candidate(
@@ -475,7 +494,23 @@ async def reveal(state, config, api_key: str, candidate_ids: list[str], *,
         except Exception as e:  # a verifier outage must not lose a paid-for contact
             logger.warning("Email check failed for a SalesQL contact: %s", type(e).__name__)
             status = "guess"
-        if status == "guess" and sq_verified and config.salesql.trust_verified:
+        answered = False
+        if status == "guess" and salesql_checks:
+            try:
+                answer = await checker.verify_email(email)
+            except sq.SalesQLError as e:
+                # Don't try the rest: a refused key or a spent balance fails
+                # every time, and a failed call may still have been charged.
+                salesql_checks = False
+                summary["messages"].append(
+                    f"SalesQL couldn't check addresses ({e}) If the key lacks the Verify "
+                    "scope, tick it on the key in SalesQL.")
+            else:
+                summary["verifications_used"] += 1
+                answered = True   # "unknown" is an answer: the mail server looked wrong
+                status = {"valid": "verified", "invalid": "invalid",
+                          "catch_all": "risky"}.get(answer, "guess")
+        if status == "guess" and not answered and sq_verified and config.salesql.trust_verified:
             status = "verified"
 
         first, last = split_name(person.get("full_name") or row["full_name"])
@@ -511,7 +546,3 @@ async def reveal(state, config, api_key: str, candidate_ids: list[str], *,
                 collector=COLLECTOR, value_num=1.0, value_text=row["title"][:120],
                 confidence=0.7)
         summary["revealed"] += 1
-
-    await state.log_action("salesql_reveal", "scout", {
-        k: summary[k] for k in ("revealed", "no_email", "skipped", "failed", "credits_used")})
-    return summary

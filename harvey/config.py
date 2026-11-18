@@ -758,6 +758,11 @@ class SalesQLConfig(BaseModel):
     # can't reach a verdict, trust that mark. An address Harvey's verifier
     # calls invalid is never sent either way.
     trust_verified: bool = True
+    # When Harvey's own verifier can't reach a verdict, ask SalesQL to check
+    # the address. One verification credit each, a separate balance from the
+    # reveal credits; SalesQL plans include a monthly allowance. The key needs
+    # the Verify scope. A check SalesQL answers wins over its older mark.
+    verify_emails: bool = True
 
     @field_validator("max_reveals_per_day")
     @classmethod

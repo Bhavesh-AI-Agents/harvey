@@ -1233,7 +1233,7 @@ async function revealSalesql() {
   _salesqlBusy = false;
   showToast(data && data.success
     ? 'Revealed ' + data.revealed + ' · no work email ' + data.no_email + ' · skipped ' +
-      data.skipped + ' · failed ' + data.failed + '. Credits used: ' + data.credits_used + '.' +
+      data.skipped + ' · failed ' + data.failed + '. Credits used: ' + data.credits_used + (data.verifications_used ? ' · address checks: ' + data.verifications_used : '') + '.' +
       (data.messages && data.messages.length ? ' ' + data.messages.join(' ') : '')
     : (data && data.message) || 'The reveal failed.', data && data.success ? 'success' : 'error');
   loadSalesql();
