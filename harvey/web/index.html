@@ -303,7 +303,7 @@
     <div class="settings-row">
       <div>
         <h3>Gmail / Google Workspace <span class="tag accent">Recommended</span> <span id="gmail-status" class="email-tag"></span></h3>
-        <p class="desc">Use a mailbox on a dedicated secondary domain. Create an OAuth client (type "Desktop app") in Google Cloud Console → Gmail API, paste the id and secret, save, then run <code>harvey gmail auth</code>.</p>
+        <p class="desc">Use mailboxes on a dedicated secondary domain. In Google Cloud Console, enable the Gmail API and create an OAuth client of type "Web application" whose authorized redirect URI is the address shown under Sending mailboxes. Paste the id and secret here and save, then add each mailbox under Sending mailboxes and sign it in.</p>
       </div>
       <div class="fields">
         <div class="form-group"><label class="form-label" for="gmail-id">Client ID</label>
