@@ -384,6 +384,37 @@ SIGNAL_CATALOG: list[dict] = [
         "cost_note": "free (site HTML)",
         "confidence_floor": 0.0,
     },
+    # ── SalesQL: who works there (recorded when a contact is revealed) ──
+    {
+        "code": "INHOUSE_DEV_COUNT",
+        "label": "Software staff at the company",
+        "description": (
+            "How many people SalesQL lists at the company with a software job "
+            "title (engineer, developer, CTO and the like). Zero means no "
+            "in-house developers were found, which is the buyer for anyone "
+            "selling software work. A database's view, not proof: a new hire "
+            "or a contractor may be missing."
+        ),
+        "category": "people",
+        "value_type": "num",
+        "collector": "salesql",
+        "cost_note": "free (one SalesQL search covers several companies)",
+        "confidence_floor": 0.0,
+    },
+    {
+        "code": "FOUNDER_NON_TECHNICAL",
+        "label": "Non-technical founder or owner",
+        "description": (
+            "The contact's title and headline carry none of your technical "
+            "words, and SalesQL shows no past software job titles. Useful for "
+            "pitching to people who buy software work instead of doing it."
+        ),
+        "category": "people",
+        "value_type": "bool",
+        "collector": "salesql",
+        "cost_note": "free (read from the SalesQL search result)",
+        "confidence_floor": 0.0,
+    },
 ]
 
 

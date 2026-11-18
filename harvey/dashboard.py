@@ -490,6 +490,150 @@ async def trulyinbox_other():
     return {"success": True}
 
 
+# ── SalesQL: find people (free), reveal the ticked ones (one credit each) ──
+
+_salesql_lock = asyncio.Lock()
+
+
+def _salesql_key() -> str:
+    return (_read_env_file().get("SALESQL_API_KEY", "")
+            or os.getenv("SALESQL_API_KEY", "")).strip()
+
+
+def _salesql_row(r: dict) -> dict:
+    return {k: r.get(k) for k in (
+        "id", "full_name", "title", "headline", "linkedin_url", "location", "org_name",
+        "org_domain", "org_industry", "org_size", "grade", "reason", "dev_count",
+        "status", "note")}
+
+
+@app.get("/api/salesql")
+async def salesql_overview():
+    """Connection, credits, today's allowance and the people found so far."""
+    from harvey.collectors import salesql as collector
+    from harvey.integrations import salesql as sq
+    state = _state()
+    await state.init_db()
+    out = {"connected": False, "key_url": sq.KEY_URL, "account": None, "error": "",
+           "cap": 0, "left_today": 0, "candidates": [], "handled": []}
+    key = _salesql_key()
+    try:
+        from harvey.config import load_config
+        config = load_config()
+        out["cap"] = config.salesql.max_reveals_per_day
+        out["left_today"] = await collector.reveals_left_today(state, config)
+    except Exception:
+        config = None
+        out["error"] = "harvey.yaml couldn't be read."
+    if key:
+        out["connected"] = True
+        try:
+            async with sq.SalesQL(key) as client:
+                out["account"] = await client.account_status()
+        except sq.SalesQLError as e:
+            out["error"] = str(e)
+    out["candidates"] = [_salesql_row(r)
+                         for r in await state.get_salesql_candidates(status="found")]
+    out["handled"] = [_salesql_row(r) for r in await state.get_salesql_candidates(limit=200)
+                      if r["status"] != "found"][:50]
+    return out
+
+
+@app.post("/api/salesql/connect")
+async def salesql_connect(request: Request):
+    """Check a SalesQL key, then save it to .env."""
+    from harvey.integrations import salesql as sq
+    try:
+        data = await request.json()
+    except Exception:
+        data = None
+    key = data.get("key") if isinstance(data, dict) else None
+    if not isinstance(key, str) or not key.strip() or len(key) > 512:
+        return JSONResponse({"success": False, "message": "Paste your SalesQL key."},
+                            status_code=400)
+    key = key.strip()
+    sq.forget_rejected(key)
+    try:
+        async with sq.SalesQL(key) as client:
+            account = await client.account_status()
+    except sq.SalesQLError as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=400)
+    async with _env_lock:
+        try:
+            _write_env_file({"SALESQL_API_KEY": key})
+        except Exception as e:
+            logger.warning("Failed to write .env: %s", e)
+            return {"success": False, "message": "Could not write .env file."}
+    return {"success": True,
+            "message": f"Connected. {account['credits']} credits left on the "
+                       f"{account['plan'] or 'current'} plan."}
+
+
+@app.post("/api/salesql/search")
+async def salesql_search():
+    """Run one search and grade the results. Spends no credits."""
+    from harvey.collectors import salesql as collector
+    from harvey.integrations import salesql as sq
+    key = _salesql_key()
+    if not key:
+        return JSONResponse({"success": False, "message": "Connect SalesQL first."},
+                            status_code=400)
+    if _salesql_lock.locked():
+        return JSONResponse({"success": False, "message": "A SalesQL request is already running."},
+                            status_code=409)
+    async with _salesql_lock:
+        try:
+            from harvey.config import load_config
+            config = load_config()
+            state = _state()
+            await state.init_db()
+            summary = await collector.search(state, config, key)
+        except sq.SalesQLError as e:
+            return JSONResponse({"success": False, "message": str(e)}, status_code=400)
+        except Exception as e:
+            logger.warning("SalesQL search failed: %s", type(e).__name__)
+            return JSONResponse({"success": False, "message": "The search failed. Check harvey.yaml."},
+                                status_code=400)
+    return {"success": True, **summary}
+
+
+@app.post("/api/salesql/reveal")
+async def salesql_reveal(request: Request):
+    """Reveal the ticked people. Spends up to one SalesQL credit each."""
+    from harvey.collectors import salesql as collector
+    from harvey.integrations import salesql as sq
+    try:
+        data = await request.json()
+    except Exception:
+        data = None
+    ids = data.get("ids") if isinstance(data, dict) else None
+    if not isinstance(ids, list) or not ids or len(ids) > 100 \
+            or not all(isinstance(i, str) and 0 < len(i) <= 64 for i in ids):
+        return JSONResponse({"success": False, "message": "Tick at least one person."},
+                            status_code=400)
+    key = _salesql_key()
+    if not key:
+        return JSONResponse({"success": False, "message": "Connect SalesQL first."},
+                            status_code=400)
+    if _salesql_lock.locked():
+        return JSONResponse({"success": False, "message": "A SalesQL request is already running."},
+                            status_code=409)
+    async with _salesql_lock:
+        try:
+            from harvey.config import load_config, load_env
+            config = load_config()
+            state = _state()
+            await state.init_db()
+            summary = await collector.reveal(state, config, key, ids, env=load_env())
+        except sq.SalesQLError as e:
+            return JSONResponse({"success": False, "message": str(e)}, status_code=400)
+        except Exception as e:
+            logger.warning("SalesQL reveal failed: %s", type(e).__name__)
+            return JSONResponse({"success": False, "message": "The reveal failed."},
+                                status_code=400)
+    return {"success": True, **summary}
+
+
 @app.post("/api/settings/test-instantly")
 async def test_instantly(request: Request):
     """Test an Instantly API key."""

@@ -200,7 +200,7 @@ you need the Codex provider.
 
 This is the part that makes Harvey different from a black box, and it is deliberately not skippable.
 
-Harvey knows how to collect **29 signals** about a business. It does not collect any of them until you say so. On first run it *proposes* the catalog; you confirm, skip, or reject each one in the dashboard or from the terminal:
+Harvey knows how to collect **31 signals** about a business. It does not collect any of them until you say so. On first run it *proposes* the catalog; you confirm, skip, or reject each one in the dashboard or from the terminal:
 
 ```bash
 harvey signals                       # review the catalog
@@ -637,6 +637,7 @@ harvey companies             # company register → CSV: every company, fit, and
 harvey sending pause|resume  # kill switch
 harvey warmup [domain]       # is the sending domain ready? (SPF/DKIM/DMARC, age, blocklists, warmup)
 harvey trulyinbox connect    # connect TrulyInbox so Harvey reads the mailbox's warmup
+harvey salesql [connect|search|list|reveal]  # find people through SalesQL; only reveal spends credits
 harvey retry-writes          # retry prospects the Writer gave up on
 harvey gmail auth            # one-time Gmail OAuth
 harvey microsoft auth|test  # one-time Microsoft 365 sign-in (docs/microsoft365.md)
@@ -713,6 +714,32 @@ your explicit choice.
 5. **Watch bounces.** Above ~3%, stop and fix list quality. Harvey trips its own kill switch past your configured threshold.
 
 *None of this is legal advice. Sending at scale or into regulated industries? Talk to a lawyer.*
+
+### Finding people with SalesQL
+
+Harvey's own prospecting starts from companies and reads their websites. When you would rather start from people (a job title, an industry, a company size, a country), connect [SalesQL](https://salesql.com), a B2B contact database. Harvey's own code talks to SalesQL's MCP server; the writing model never sees the connection and keeps running with no tools.
+
+1. **Connect.** Create an API/MCP key in SalesQL (Dashboard > Enrichment > API; it works on every plan, the free one included) and run `harvey salesql connect`, or paste it on the dashboard's Discover tab. It is saved to `.env` as `SALESQL_API_KEY`.
+2. **Search (free).** `harvey salesql search`, or *Search* on the Discover tab. Harvey searches with `icp.titles`, `icp.industries`, `icp.company_size` and the countries in `icp.geography`, leaving out anyone who ever held a software job title. Contact data comes back masked, so a search can't spend a credit.
+3. **Sorted for you.** Each person is marked **qualified**, **unsure** or **rejected**, with the reason: a technical word in their title or headline, a company outside the size you asked for, or how many people at their company have a software job title (one more free search covers several companies). A company check that SalesQL cut short leaves its people *unsure* instead of calling the company developer-free.
+4. **Reveal the ones you tick.** `harvey salesql reveal <id> ...` or `--qualified`, or tick rows on the Discover tab. This is the only step that spends SalesQL credits: up to one per person found. It stops at `salesql.max_reveals_per_day` (25 by default) and at the credits your account has left, and it asks first. Companies and addresses on your do-not-contact list are dropped before anything is spent.
+5. **Verified like any other address.** Each revealed work address goes through Harvey's verifier. Personal addresses are never used. An address at the company's own domain wins over one at another business. If Harvey's verifier can't reach a verdict and SalesQL marked the address verified, it counts as verified (`salesql.trust_verified: false` turns that off); an address the verifier calls invalid is never emailed.
+
+Revealed people are ordinary contacts from then on: the writer drafts for them and every email waits in the Outbox as usual. Two signals record what was found when you confirm them: `INHOUSE_DEV_COUNT` and `FOUNDER_NON_TECHNICAL`.
+
+```yaml
+salesql:
+  max_reveals_per_day: 25
+  company_keywords: []        # e.g. ["merchant services"]: find these companies first, then their people
+  job_titles: []              # empty: icp.titles
+  industries: []              # SalesQL industry names; empty: icp.industries
+  company_sizes: []           # "1-10", "11-50", ...; empty: from icp.company_size
+  countries: []               # empty: the countries in icp.geography
+  require_no_developers: true # false keeps companies with their own developers
+  technical_words: [engineer, developer, programmer, cto, ...]
+```
+
+An industry filter is broad and noisy (it matches any company a person is attached to). `company_keywords` is usually sharper. Harvey never opens or scrapes linkedin.com: a LinkedIn URL is only an identifier SalesQL returns and accepts.
 
 ### Warmup with TrulyInbox
 

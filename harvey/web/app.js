@@ -409,7 +409,7 @@ function loadCurrentTab() {
   switch (currentTab) {
     case 'today': loadLiveStatus(); loadToday(); loadTrend(); loadFunnel(); loadSetupStatus(); loadRuns(); loadTodayActivity(); break;
     case 'signals': loadSignals(); break;
-    case 'discover': loadDiscoverProviders(); break;
+    case 'discover': loadDiscoverProviders(); loadSalesql(); break;
     case 'companies': if (!companyDrill) loadCompanies(); break;
     case 'prospects': loadProspects(); break;
     case 'campaigns': loadCampaigns(); break;
@@ -967,6 +967,118 @@ async function stopDiscovery() {
 
 // Companies found but not looked at: reading their sites is free and
 // model-free, and it is what makes an email specific.
+// ── SalesQL: search is free, a reveal spends one credit per person ──
+let _salesqlBusy = false;
+
+async function loadSalesql() {
+  const el = document.getElementById('salesql-card');
+  if (!el) return;
+  const data = await api('/api/salesql');
+  if (!data) { el.innerHTML = offlineState(); return; }
+  if (!data.connected) {
+    el.innerHTML = '<div class="card"><p>Find people by job title, industry, company size and ' +
+      'country, and check whether their company has software staff. Searching is free. ' +
+      'Revealing a contact spends one SalesQL credit, and only for people you tick.</p>' +
+      '<div class="form-row"><div class="form-group" style="flex:2">' +
+      '<label class="form-label" for="salesql-key">SalesQL API/MCP key</label>' +
+      '<input class="form-input" id="salesql-key" type="password" autocomplete="off" ' +
+      'placeholder="Paste the key"></div></div>' +
+      '<div class="btn-group"><button class="btn btn-primary" onclick="connectSalesql()">Connect</button>' +
+      '<a class="btn btn-secondary" href="' + safeHref(data.key_url) +
+      '" target="_blank" rel="noopener noreferrer">Get a key</a></div></div>';
+    return;
+  }
+  const a = data.account;
+  let head = '<div class="card"><p style="margin:0 0 4px"><b>Account:</b> ' +
+    (a ? escHtml(a.plan || 'SalesQL') + ' &middot; ' + a.credits + ' credits left' +
+         (a.credits_refresh_date ? ' (refresh ' + escHtml(a.credits_refresh_date) + ')' : '')
+       : escHtml(data.error || 'Could not read the account.')) + '</p>' +
+    '<p style="margin:0"><b>Today:</b> ' + data.left_today + ' of ' +
+    data.cap + ' reveals left (your cap in harvey.yaml)</p>' +
+    '<div class="btn-group" style="margin-top:12px">' +
+    '<button class="btn btn-secondary" id="salesql-search" onclick="searchSalesql()"' +
+    (_salesqlBusy ? ' disabled' : '') + '>Search (free)</button>' +
+    '<button class="btn btn-primary" id="salesql-reveal" onclick="revealSalesql()" disabled>' +
+    'Tick people to reveal</button></div></div>';
+  const rows = data.candidates || [];
+  if (!rows.length) {
+    el.innerHTML = head + emptyState('&#128269;', 'Nobody found yet',
+      'Press <b>Search</b>. It uses the job titles, industries, company size and countries ' +
+      'in your ICP, and spends no credits.');
+    return;
+  }
+  const tone = {qualified: 't-good', unsure: 't-waiting', rejected: 't-bad'};
+  head += '<div class="table-card" style="margin-top:16px"><table><thead><tr><th></th>' +
+    '<th>Person</th><th>Company</th><th>Fit</th><th>Why</th></tr></thead><tbody>' +
+    rows.map(r => '<tr><td><input type="checkbox" class="salesql-pick" value="' +
+      escHtml(r.id) + '"' + (r.grade === 'qualified' ? ' checked' : '') +
+      ' onchange="countSalesqlPicks()"></td>' +
+      '<td><b>' + escHtml(r.full_name) + '</b><br><span class="muted">' + escHtml(r.title) +
+      (r.location ? ' &middot; ' + escHtml(r.location) : '') + '</span></td>' +
+      '<td>' + escHtml(r.org_name || '') + '<br><span class="muted">' +
+      escHtml([r.org_industry, r.org_size].filter(Boolean).join(' · ')) + '</span></td>' +
+      '<td><span class="badge ' + (tone[r.grade] || 't-waiting') + '">' + escHtml(r.grade) +
+      '</span></td><td>' + escHtml(r.reason || '') + '</td></tr>').join('') +
+    '</tbody></table></div>';
+  el.innerHTML = head;
+  countSalesqlPicks();
+}
+
+function countSalesqlPicks() {
+  const n = document.querySelectorAll('.salesql-pick:checked').length;
+  const btn = document.getElementById('salesql-reveal');
+  if (!btn) return;
+  btn.disabled = !n || _salesqlBusy;
+  btn.textContent = n ? 'Reveal ' + n + ' (' + n + (n === 1 ? ' credit' : ' credits') + ' at most)'
+                      : 'Tick people to reveal';
+}
+
+async function connectSalesql() {
+  const key = (document.getElementById('salesql-key') || {}).value || '';
+  const data = await api('/api/salesql/connect', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({key: key}),
+  });
+  showToast(data && data.message ? data.message : 'Could not connect.',
+            data && data.success ? 'success' : 'error');
+  loadSalesql();
+}
+
+async function searchSalesql() {
+  if (_salesqlBusy) return;
+  _salesqlBusy = true;
+  const btn = document.getElementById('salesql-search');
+  if (btn) { btn.disabled = true; btn.textContent = 'Searching…'; }
+  const data = await api('/api/salesql/search', {method: 'POST'});
+  _salesqlBusy = false;
+  showToast(data && data.success
+    ? data.found + ' found: ' + data.qualified + ' qualified, ' + data.unsure + ' unsure, ' +
+      data.rejected + ' rejected. No credits spent.'
+    : (data && data.message) || 'The search failed.', data && data.success ? 'success' : 'error');
+  loadSalesql();
+}
+
+async function revealSalesql() {
+  if (_salesqlBusy) return;
+  const ids = [...document.querySelectorAll('.salesql-pick:checked')].map(c => c.value);
+  if (!ids.length) return;
+  if (!confirm('Reveal ' + ids.length + (ids.length === 1 ? ' person' : ' people') +
+               '? This spends up to ' + ids.length + ' SalesQL credits.')) return;
+  _salesqlBusy = true;
+  countSalesqlPicks();
+  const data = await api('/api/salesql/reveal', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ids: ids}),
+  });
+  _salesqlBusy = false;
+  showToast(data && data.success
+    ? 'Revealed ' + data.revealed + ' · no work email ' + data.no_email + ' · skipped ' +
+      data.skipped + ' · failed ' + data.failed + '. Credits used: ' + data.credits_used + '.' +
+      (data.messages && data.messages.length ? ' ' + data.messages.join(' ') : '')
+    : (data && data.message) || 'The reveal failed.', data && data.success ? 'success' : 'error');
+  loadSalesql();
+}
+
 function renderProfileCard(pending, running) {
   const el = document.getElementById('discover-profile');
   if (!el) return;

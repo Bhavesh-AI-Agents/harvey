@@ -877,6 +877,137 @@ def _warmup_service_check(address: str, warmup):
     return asyncio.run(_run())
 
 
+def cmd_salesql(args):
+    """SalesQL: connect a key, search for people (free), list them, reveal the ticked ones."""
+    import getpass
+
+    from dotenv import load_dotenv
+
+    from harvey.collectors import salesql as collector
+    from harvey.config import ConfigError, load_config, load_env
+    from harvey.integrations import salesql as sq
+    from harvey.paths import PROJECT_ROOT
+    from harvey.state import StateManager
+
+    load_dotenv(PROJECT_ROOT / ".env")
+    action = args.salesql_action
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        if action == "connect":
+            print("\n  Connect SalesQL. In SalesQL, open Dashboard > Enrichment > API and")
+            print(f"  create an API/MCP key ({sq.KEY_URL}).")
+            print("  It works on every SalesQL plan. Searching is free; revealing a contact")
+            print("  spends one credit, and only for people you tick.\n")
+            key = getpass.getpass("  SalesQL key (hidden): ").strip()
+            if not key:
+                print("\n  No key entered.\n")
+                return 1
+            sq.forget_rejected(key)
+            try:
+                async with sq.SalesQL(key) as client:
+                    account = await client.account_status()
+            except sq.SalesQLError as e:
+                print(f"\n  {e}\n")
+                return 1
+            from harvey.dashboard import _write_env_file
+            try:
+                _write_env_file({"SALESQL_API_KEY": key})
+            except OSError as e:
+                print(f"\n  Couldn't save the key to .env: {e}\n")
+                return 1
+            print(f"\n  Connected. Plan: {account['plan'] or 'unknown'}, "
+                  f"{account['credits']} credits left.\n")
+            return 0
+
+        key = sq.key_from_env()
+        if not key:
+            print("\n  SalesQL isn't connected. Run: harvey salesql connect\n")
+            return 1
+        try:
+            config = load_config()
+        except ConfigError as e:
+            print(f"\n  {e}\n")
+            return 1
+        try:
+            if action == "status":
+                async with sq.SalesQL(key) as client:
+                    account = await client.account_status()
+                left = await collector.reveals_left_today(state, config)
+                waiting = len(await state.get_salesql_candidates(status="found"))
+                print(f"\n  SalesQL plan: {account['plan'] or 'unknown'}")
+                print(f"  Credits left: {account['credits']} of {account['monthly_included']} a month"
+                      + (f" (refresh {account['credits_refresh_date']})"
+                         if account["credits_refresh_date"] else ""))
+                print(f"  SalesQL's daily limits: {account['searches_per_day']} searches, "
+                      f"{account['reveals_per_day']} reveals")
+                print(f"  Harvey's cap: {left} of {config.salesql.max_reveals_per_day} "
+                      "reveals left today")
+                print(f"  People found and not yet revealed: {waiting}\n")
+                return 0
+            if action == "search":
+                summary = await collector.search(state, config, key)
+                print(f"\n  SalesQL has {summary['total']} matches; this search brought back "
+                      f"{summary['found']} ({summary['new']} new).")
+                print(f"  Qualified {summary['qualified']} · unsure {summary['unsure']} · "
+                      f"rejected {summary['rejected']}. No credits spent.")
+                for note in summary["notes"]:
+                    print(f"  Note: {note}")
+                print("  See them: harvey salesql list\n")
+                return 0
+            if action == "list":
+                rows = await state.get_salesql_candidates(status="found")
+                if not rows:
+                    print("\n  Nobody waiting. Run: harvey salesql search\n")
+                    return 0
+                print()
+                for r in rows:
+                    print(f"  [{r['grade']:<9}] {r['id'][:8]}  {r['full_name']} · {r['title']} "
+                          f"· {r['org_name'] or 'no company'}")
+                    print(f"              {r['reason']}")
+                print("\n  Reveal: harvey salesql reveal <id> [<id> ...]   or   "
+                      "harvey salesql reveal --qualified\n")
+                return 0
+            if action == "reveal":
+                rows = await state.get_salesql_candidates(status="found")
+                if args.qualified:
+                    chosen = [r["id"] for r in rows if r["grade"] == "qualified"]
+                else:
+                    chosen = [r["id"] for r in rows
+                              if any(r["id"].startswith(i) for i in args.ids if len(i) >= 6)]
+                if args.limit:
+                    chosen = chosen[:args.limit]
+                if not chosen:
+                    print("\n  Nobody matched. Give ids from 'harvey salesql list', "
+                          "or --qualified.\n")
+                    return 1
+                if not args.yes:
+                    answer = input(f"\n  Reveal {len(chosen)} "
+                                   f"{'person' if len(chosen) == 1 else 'people'}? This spends up "
+                                   f"to {len(chosen)} SalesQL credits. Type yes: ").strip().lower()
+                    if answer != "yes":
+                        print("\n  Nothing revealed.\n")
+                        return 0
+                summary = await collector.reveal(state, config, key, chosen, env=load_env())
+                print(f"\n  Revealed {summary['revealed']} · no work email {summary['no_email']} "
+                      f"· skipped {summary['skipped']} · failed {summary['failed']}. "
+                      f"Credits used: {summary['credits_used']}.")
+                for message in summary["messages"]:
+                    print(f"  {message}")
+                print("  Revealed people are now contacts; only verified addresses are "
+                      "written to.\n")
+                return 0
+        except sq.SalesQLError as e:
+            print(f"\n  {e}\n")
+            return 1
+        return 0
+
+    code = asyncio.run(_run())
+    if code:
+        raise SystemExit(code)
+
+
 def cmd_trulyinbox(args):
     """Connect TrulyInbox, record another warmup service, or show the status."""
     import getpass
@@ -1142,6 +1273,19 @@ def main():
                      help="connect a key, 'other' if you use another warmup service, "
                           "or show the status (default)")
     sub.set_defaults(func=cmd_trulyinbox)
+
+    sub = subparsers.add_parser(
+        "salesql", help="Find people through SalesQL: search (free), then reveal the ones you pick")
+    sub.add_argument("salesql_action", nargs="?", default="status",
+                     choices=["status", "connect", "search", "list", "reveal"],
+                     help="show the status (default), connect a key, search, list who was "
+                          "found, or reveal contacts")
+    sub.add_argument("ids", nargs="*", help="reveal: ids from 'harvey salesql list'")
+    sub.add_argument("--qualified", action="store_true",
+                     help="reveal: everyone graded qualified")
+    sub.add_argument("--limit", type=int, default=0, help="reveal: at most this many")
+    sub.add_argument("--yes", action="store_true", help="reveal: don't ask before spending credits")
+    sub.set_defaults(func=cmd_salesql)
 
     # harvey usage
     sub = subparsers.add_parser("usage", help="Show brain usage and quota (Claude or Codex)")
