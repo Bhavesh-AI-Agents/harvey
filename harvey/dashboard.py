@@ -865,6 +865,34 @@ async def salesql_cap(request: Request):
     return {"success": True, "cap": cap}
 
 
+@app.post("/api/salesql/lookup")
+async def salesql_lookup(request: Request):
+    """The names SalesQL has for what was typed: countries, states or industries. Free."""
+    from harvey.collectors import salesql as collector
+    from harvey.integrations import salesql as sq
+    try:
+        data = await request.json()
+    except Exception:
+        data = None
+    kind = data.get("kind") if isinstance(data, dict) else None
+    q = data.get("q") if isinstance(data, dict) else None
+    if kind not in ("country", "region", "industry") or not isinstance(q, str) \
+            or not 2 <= len(q.strip()) <= 100:
+        return JSONResponse({"success": False, "message": "Type at least two letters."},
+                            status_code=400)
+    key = _salesql_key()
+    if not key:
+        return JSONResponse({"success": False, "message": "Connect SalesQL first."},
+                            status_code=400)
+    state = _state()
+    await state.init_db()
+    try:
+        names = await collector.suggest(state, key, kind, q.strip())
+    except sq.SalesQLError as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=400)
+    return {"success": True, "values": names}
+
+
 @app.post("/api/salesql/settings")
 async def salesql_settings(request: Request):
     """Save who a search looks for: titles, size, place, industries."""
