@@ -88,6 +88,10 @@ class FakeSalesQL:
             if params["type"] == "country":
                 return {"values": [{"value": US, "label": "United States"}]
                         if params.get("q") == "United States" else []}
+            if params["type"] == "region":
+                return {"values": [{"value": "r-ca-city", "label": "California City, California"},
+                                   {"value": "r-ca", "label": "California, United States"}]
+                        if params.get("q") == "California" else []}
             if params["type"] == "industry":
                 return {"values": [{"value": "financial-services", "label": "Financial Services"}]}
             return {"values": []}
@@ -510,3 +514,32 @@ async def test_a_key_without_the_verify_scope_is_tried_once_and_says_so(state):
     assert any("Verify" in m for m in out["messages"])
     # SalesQL's own mark still counts when its check couldn't run.
     assert (await state.get_prospect_by_email("p-ben@lakeside.example")).email_status == "verified"
+
+
+@pytest.mark.asyncio
+async def test_a_state_narrows_both_the_person_and_the_company(state):
+    fake = FakeSalesQL()
+    await collector.search(state, make_config(states=["California"]), KEY, transport=fake.transport)
+    sent = fake.tools("search_people")[0]["params"]
+    assert sent["organization_states_or_cities"] == ["r-ca"] and sent["states_or_cities"] == ["r-ca"]
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_state_stops_the_search_instead_of_widening_it(state):
+    fake = FakeSalesQL()
+    with pytest.raises(sq.SalesQLError, match="salesql.states"):
+        await collector.search(state, make_config(states=["Atlantis"]), KEY,
+                               transport=fake.transport)
+    assert not fake.tools("search_people")
+
+
+@pytest.mark.asyncio
+async def test_many_addresses_are_checked_in_one_reveal(state):
+    fake = FakeSalesQL()
+    config = make_config(verify_emails=True)
+    await collector.search(state, config, KEY, transport=fake.transport)
+    out = await collector.reveal(state, config, KEY, ["p-ada", "p-ben", "p-cal"], verify=_guess,
+                                 transport=fake.transport)
+    assert out["revealed"] == 3 and out["verifications_used"] == 3
+    assert sorted(c["params"]["email"] for c in fake.tools("verify_email")) == [
+        "p-ada@northvale.example", "p-ben@lakeside.example", "p-cal@hillside.example"]
