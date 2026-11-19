@@ -108,6 +108,16 @@ class FakeSalesQL:
                 return {"results": PEOPLE, "total": 1234}
             total = self.dev_total if self.dev_total is not None else len(self.developers)
             return {"results": self.developers, "total": total}
+        if name == "enrich_organization":
+            domain = params.get("organization_domain") or ""
+            if not domain:
+                return {"found": False, "organization": None}
+            return {"found": True, "organization": {
+                "uuid": "org-" + domain, "name": domain.split(".")[0].title(),
+                "website": f"https://{domain}/", "website_domain": domain,
+                "linkedin_url": f"https://linkedin.com/company/{domain.split('.')[0]}",
+                "founded_year": 2015, "number_of_employees": "11 - 50",
+                "industry": "Financial Services", "location": None, "type": None}}
         if name == "enrich_person_bulk":
             if self.enrich is not None:
                 return self.enrich(params["persons"])
@@ -1142,3 +1152,47 @@ async def test_widening_an_audience_brings_earlier_people_back_to_qualified(stat
     out = await collector.search(state, make_config(), KEY, transport=empty.transport)
     assert (await state.get_salesql_candidates(ids=["p-ada"]))[0]["grade"] == "qualified"
     assert any("now fit this audience" in n for n in out["notes"])
+
+
+# ── Keeping everything a reveal returns ──
+
+def test_work_history_is_read_whatever_the_list_is_called():
+    person = {"experiences": [
+        {"title": "Founder", "organization": {"name": "Northvale Payments", "website_domain": "northvale.example"},
+         "start_date": "2019-03", "is_current": True},
+        {"job_title": "Analyst", "company_name": "Lakeside Merchant Co", "from": "2014", "to": "2019",
+         "location": {"city": "Austin", "state": "Texas"}},
+        {"note": "nothing usable"}, "junk"]}
+    jobs = collector.work_history(person)
+    assert [(j["title"], j["company"], j["current"]) for j in jobs] == [
+        ("Founder", "Northvale Payments", True), ("Analyst", "Lakeside Merchant Co", False)]
+    assert jobs[0]["company_domain"] == "northvale.example" and jobs[1]["location"] == "Austin, Texas"
+    assert collector.work_history({}) == []
+
+
+def test_a_contact_keeps_jobs_the_company_profile_and_the_search_row():
+    person = {"full_name": "Ada Example", "emails": [], "work_experience": []}
+    row = {"org_name": "Northvale Payments", "org_domain": "northvale.example",
+           "raw_json": '{"uuid": "p-ada", "title": "Founder"}'}
+    details = collector.contact_details(person, row, "", "", company_profile={"name": "Northvale", "founded_year": 2015})
+    assert details["work_history"] == [] and details["work_history_asked"] is True
+    assert details["company_profile"]["founded_year"] == 2015
+    assert details["salesql_search"] == {"uuid": "p-ada", "title": "Founder"}
+    old = collector.contact_details({"full_name": "Ada Example"}, {"raw_json": "not json"}, "", "")
+    assert old["work_history_asked"] is False and old["salesql_search"] == {} and old["company_profile"] == {}
+
+
+@pytest.mark.asyncio
+async def test_a_reveal_asks_for_work_history_and_the_free_company_profile(state):
+    fake = FakeSalesQL()
+    await collector.search(state, make_config(), KEY, transport=fake.transport)
+    rows = await state.get_salesql_candidates()
+    ada = next(r for r in rows if r["id"] == "p-ada")
+    await collector.reveal(state, make_config(), KEY, [ada["id"]], transport=fake.transport,
+                           verify=lambda *a, **k: None)
+    assert fake.tools("enrich_person_bulk")[0]["params"]["include_work_experience"] is True
+    assert len(fake.tools("enrich_organization")) == 1
+    revealed = next(r for r in await state.get_salesql_candidates() if r["id"] == "p-ada")
+    details = await state.get_prospect_details(revealed["prospect_id"])
+    assert details["company_profile"]["founded_year"] == 2015
+    assert details["salesql_search"].get("uuid") == "p-ada"
