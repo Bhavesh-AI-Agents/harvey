@@ -272,7 +272,22 @@ class SalesQL:
         return {"results": [r for r in _list(data.get("results")) if isinstance(r, dict)],
                 "total": _int(data.get("total"))}
 
-    async def enrich_people(self, persons: list[dict]) -> list[dict]:
+    async def enrich_organization(self, domain: str = "", linkedin_url: str = "",
+                                  name: str = "") -> dict:
+        """One company's profile (website, LinkedIn, founded year, size,
+        industry, location, type). Free. {} when SalesQL doesn't know it."""
+        params = ({"linkedin_url": linkedin_url} if linkedin_url
+                  else {"organization_domain": domain} if domain
+                  else {"organization_name": name} if name else None)
+        if not params:
+            return {}
+        data = _dict(await self._tool("enrich_organization", {"params": params}))
+        if data.get("found") is False:
+            return {}
+        org = _dict(data.get("organization")) or data
+        return org if (_str(org.get("name")) or _str(org.get("uuid"))) else {}
+
+    async def enrich_people(self, persons: list[dict], work_history: bool = False) -> list[dict]:
         """Reveal contact data for up to 100 people. SPENDS CREDITS: up to one
         per person found. Returns one entry per request item, in order: the
         person's profile, or {} when SalesQL found nobody or returned an error
@@ -281,7 +296,7 @@ class SalesQL:
         if not persons:
             return []
         data = await self._tool("enrich_person_bulk", {
-            "params": {"persons": persons, "include_work_experience": False}})
+            "params": {"persons": persons, "include_work_experience": bool(work_history)}})
         items = data if isinstance(data, list) else None
         if items is None:
             for key in ("results", "persons", "items", "data"):

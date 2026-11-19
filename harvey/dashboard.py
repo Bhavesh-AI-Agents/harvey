@@ -1766,7 +1766,10 @@ async def get_prospects():
         except ValueError:
             details = {}
         details = details if isinstance(details, dict) else {}
+        # The untouched replies can be large; the contact sheet fetches them
+        # for one person at a time (/api/prospects/{id}/details).
         details.pop("salesql_reply", None)
+        details.pop("salesql_search", None)
         r["details"] = details
     return rows
 
@@ -2315,6 +2318,19 @@ async def get_campaigns():
                 and (r.get("email_status") or "guess") in HAND_SENDABLE_EMAIL
             )
     return rows
+
+
+@app.get("/api/prospects/{prospect_id}/details")
+async def prospect_details(prospect_id: str):
+    """Everything held on one contact, including the untouched SalesQL replies."""
+    rows = await query_db("SELECT details_json FROM prospects WHERE id = ?", (prospect_id,))
+    if not rows:
+        return JSONResponse({"error": "No such contact."}, status_code=404)
+    try:
+        details = json.loads(rows[0].get("details_json") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        details = {}
+    return {"details": details if isinstance(details, dict) else {}}
 
 
 @app.get("/api/prospects/{prospect_id}/opt-out")

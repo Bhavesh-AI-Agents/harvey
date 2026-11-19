@@ -1474,7 +1474,41 @@ def pick_phone(person: dict) -> tuple[str, bool]:
     return best
 
 
-def contact_details(person: dict, row: dict, chosen_email: str, chosen_phone: str) -> dict:
+# Where a reveal keeps the person's jobs, whatever SalesQL calls the list.
+_HISTORY_KEYS = ("work_experience", "work_experiences", "experience", "experiences",
+                 "positions", "employment_history", "work_history")
+
+
+def work_history(person: dict) -> list[dict]:
+    """The person's jobs, newest first as SalesQL gives them, in plain
+    fields. [] when the reveal didn't ask for them or there are none."""
+    raw = next((person.get(k) for k in _HISTORY_KEYS if isinstance(person.get(k), list)), [])
+    out = []
+    for job in raw:
+        if not isinstance(job, dict):
+            continue
+        org = _d(job.get("organization") or job.get("company"))
+        entry = {
+            "title": _s(job.get("title") or job.get("job_title") or job.get("position")),
+            "company": _s(org.get("name") or job.get("organization_name") or job.get("company_name")
+                          or (job.get("company") if isinstance(job.get("company"), str) else "")),
+            "company_domain": _s(org.get("website_domain") or org.get("domain")),
+            "company_linkedin": _s(org.get("linkedin_url")),
+            "start": _s(job.get("start_date") or job.get("started_at") or job.get("from")),
+            "end": _s(job.get("end_date") or job.get("ended_at") or job.get("to")),
+            "current": job.get("is_current") is True or job.get("current") is True,
+            "location": _s(job.get("location")) if not isinstance(job.get("location"), dict)
+            else ", ".join(p for p in (_s(_d(job["location"]).get(k))
+                                       for k in ("city", "state", "country")) if p),
+            "description": _s(job.get("description"))[:1000],
+        }
+        if entry["title"] or entry["company"]:
+            out.append(entry)
+    return out
+
+
+def contact_details(person: dict, row: dict, chosen_email: str, chosen_phone: str,
+                    company_profile: dict | None = None) -> dict:
     """Everything a reveal returned, in a shape other tools can read.
 
     Harvey emails one work address and shows one phone, but the reveal was
@@ -1518,8 +1552,25 @@ def contact_details(person: dict, row: dict, chosen_email: str, chosen_phone: st
         "company": {"name": row.get("org_name", ""), "domain": row.get("org_domain", ""),
                     "industry": row.get("org_industry", ""), "size": row.get("org_size", ""),
                     "salesql_id": row.get("org_uuid", "")},
+        "work_history": work_history(person),
+        # False: the reveal did not ask for jobs, so an empty list means "not
+        # asked", not "none". Asking again costs the credit again.
+        "work_history_asked": any(k in person for k in _HISTORY_KEYS),
+        # The company's own SalesQL profile (free), untouched.
+        "company_profile": company_profile if isinstance(company_profile, dict) else {},
+        # What the search showed before the reveal (grade, reason, masked data).
+        "salesql_search": _search_row(row),
         "salesql_reply": person,
     }
+
+
+def _search_row(row: dict) -> dict:
+    try:
+        found = json.loads(row.get("raw_json") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        found = {}
+    return found if isinstance(found, dict) else {}
+
 
 
 def split_name(full_name: str) -> tuple[str, str]:
@@ -1546,6 +1597,7 @@ async def reveal(state, config, api_key: str, candidate_ids: list[str], *,
     summary = {"asked": len(candidate_ids), "revealed": 0, "no_email": 0, "skipped": 0,
                "failed": 0, "held_back": 0, "credits_used": 0, "verifications_used": 0,
                "messages": []}
+    company_profiles: dict[str, dict] = {}
     rows = [r for r in await state.get_salesql_candidates(ids=list(dict.fromkeys(candidate_ids)))
             if r["status"] == "found"]
     if not rows:
@@ -1587,12 +1639,25 @@ async def reveal(state, config, api_key: str, candidate_ids: list[str], *,
                 requests.append({"full_name": r["full_name"],
                                  "organization_name": r["org_name"]})
         try:
-            people = await client.enrich_people(requests)
+            people = await client.enrich_people(
+                requests, work_history=bool(getattr(config.salesql, "work_history", True)))
         except sq.SalesQLError:
             # The request may have been charged. Count it against today's cap
             # so a retry loop can't run the balance down.
             await state.increment_setting(_usage_key(), len(rows))
             raise
+        # The company's own profile is free, so it is kept with the person.
+        # Best effort: a reveal already paid for never fails over it.
+        for r, person in zip(rows, people):
+            key = r["org_domain"] or r["org_name"]
+            if not person or not key or key in company_profiles:
+                continue
+            try:
+                company_profiles[key] = await client.enrich_organization(
+                    domain=r["org_domain"], name=r["org_name"])
+            except Exception as e:
+                company_profiles[key] = {}
+                logger.info("SalesQL: no company profile for %s: %s", key, e)
 
     matched = sum(1 for p in people if p)
     summary["credits_used"] = matched
@@ -1602,7 +1667,7 @@ async def reveal(state, config, api_key: str, candidate_ids: list[str], *,
     checker = sq.SalesQL(api_key, transport=transport)
     try:
         await _file_people(state, config, rows, people, summary, blocked, confirmed,
-                           verify, env, checker)
+                           verify, env, checker, company_profiles=company_profiles)
     finally:
         await checker.aclose()
 
@@ -1650,7 +1715,7 @@ async def _salesql_checks(checker, emails: list[str], summary: dict) -> dict[str
 
 
 async def _file_people(state, config, rows, people, summary, blocked, confirmed,
-                       verify, env, checker):
+                       verify, env, checker, company_profiles=None):
     """Turn each revealed profile into a prospect with a checked address."""
     from harvey.gate import do_not_contact_match
     ready = []      # [row, person, email, sq_verified, phone, phone_verified, status]
@@ -1712,7 +1777,9 @@ async def _file_people(state, config, rows, people, summary, blocked, confirmed,
             personalization_notes="\n".join(notes), company=row["org_name"],
             industry=row["org_industry"], company_size=row["org_size"]))
         await state.set_prospect_details(
-            prospect_id, contact_details(person, row, email, phone))
+            prospect_id, contact_details(
+                person, row, email, phone,
+                company_profile=(company_profiles or {}).get(row["org_domain"] or row["org_name"])))
         await state.update_salesql_candidate(
             row["id"], status="revealed", prospect_id=prospect_id,
             note={"verified": "Address verified.", "risky": "Address is on a catch-all domain.",

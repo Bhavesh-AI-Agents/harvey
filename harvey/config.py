@@ -856,6 +856,9 @@ class SalesQLConfig(BaseModel):
     # can't reach a verdict, trust that mark. An address Harvey's verifier
     # calls invalid is never sent either way.
     trust_verified: bool = True
+    # Ask for each person's work history on reveal. It comes with the same
+    # credit; asking again later for someone already revealed is charged again.
+    work_history: bool = True
     # When Harvey's own verifier can't reach a verdict, ask SalesQL to check
     # the address. One verification credit each, a separate balance from the
     # reveal credits; SalesQL plans include a monthly allowance. The key needs

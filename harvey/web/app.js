@@ -2619,9 +2619,10 @@ function renderContacts() {
     '<th>Score</th><th>Status</th><th>Source</th><th>Added</th><th></th></tr></thead><tbody>';
   for (const [p, i] of rows) {
     html += '<tr><td><div class="cell-row"><span class="avatar">' + initials(p.first_name, p.last_name) + '</span>' +
-        '<div class="cell-stack"><span class="cell-main">' + escHtml(p.first_name) + ' ' + escHtml(p.last_name) + '</span>' +
+        '<div class="cell-stack"><a class="cell-main cs-open" href="#" onclick="toggleContactDetails(' + i + ');return false">' + escHtml(p.first_name) + ' ' + escHtml(p.last_name) + '</a>' +
         '<span class="cell-sub">' + escHtml(p.title) + '</span></div></div></td>' +
-      '<td>' + escHtml(p.company) + '</td>' +
+      '<td><div class="cell-stack"><span>' + escHtml(p.company) + '</span>' +
+        '<span class="cell-sub">' + escHtml((p.details || {}).location || '') + '</span></div></td>' +
       '<td><div class="cell-stack"><span>' + escHtml(p.email) + '</span>' +
         '<span class="cell-sub">' + [emailTag(p).trim(), p.phone ? escHtml(p.phone) +
           (p.phone_verified ? ' <span class="verified" title="Phone verified">&#10003;</span>' : '') : '']
@@ -2635,51 +2636,168 @@ function renderContacts() {
         ? '<button class="btn btn-ghost btn-sm" onclick="toggleOptOut(' + i + ')" ' +
           'aria-expanded="' + (_optOut.id === p.id) + '" title="What made Harvey stop emailing them">' +
           (p.status === 'opted_out' ? 'Why?' : 'Opt-out history') + '</button>' : '') +
-        '<button class="btn btn-ghost btn-sm" onclick="toggleContactDetails(' + i + ')" aria-expanded="' +
-        (_contactOpen === p.id) + '" title="Everything Harvey holds on this person">Details</button>' +
+        '<button class="btn btn-secondary btn-sm" onclick="toggleContactDetails(' + i + ')" ' +
+        'title="Everything Harvey holds on this person">Open</button>' +
         '<button class="btn btn-ghost btn-sm row-action" onclick="fbProspect(' + i + ')" ' +
         'title="Leave feedback on this contact">Feedback</button></div></td></tr>';
-    if (_contactOpen === p.id) html += '<tr class="detail-row"><td colspan="8">' + contactDetailsPanel(p) + '</td></tr>';
     if (_optOut.id === p.id) html += '<tr class="detail-row"><td colspan="8">' + optOutPanel(p) + '</td></tr>';
   }
   rowsEl.innerHTML = html + '</tbody></table></div>' +
     '<div class="table-foot">' + rows.length + ' of ' + _prospects.length + ' contacts</div>';
+  renderContactSheet();
 }
 
-// Everything held on one contact: every email and phone the source returned,
-// not only the one of each that Harvey uses.
+// The contact sheet: everything held on one person. Known fields are laid
+// out in sections; whatever else the source returned is listed under
+// "Everything SalesQL returned", so nothing that was paid for is hidden.
 let _contactOpen = null;
 
 function toggleContactDetails(i) {
   const p = _prospects[i];
   if (!p) return;
   _contactOpen = _contactOpen === p.id ? null : p.id;
-  renderContacts();
+  renderContactSheet();
+  if (_contactOpen && !p.details_full) {
+    // The list carries the short form; the untouched replies come per person.
+    api('/api/prospects/' + encodeURIComponent(p.id) + '/details').then(data => {
+      if (!data || !data.details) return;
+      p.details = data.details;
+      p.details_full = true;
+      if (_contactOpen === p.id) renderContactSheet();
+    });
+  }
+}
+function closeContactSheet() { _contactOpen = null; renderContactSheet(); }
+
+function csLabel(key) {
+  const text = String(key).replace(/_/g, ' ').replace(/\burl\b/i, 'link').trim();
+  return escHtml(text.charAt(0).toUpperCase() + text.slice(1));
+}
+function csEmpty(v) {
+  return v === null || v === undefined || v === '' ||
+    (Array.isArray(v) && !v.length) || (typeof v === 'object' && !Array.isArray(v) && !Object.keys(v).length);
+}
+function csScalar(v, key) {
+  if (typeof v === 'boolean') return v ? 'Yes' : 'No';
+  const text = String(v);
+  if (/^https?:\/\//i.test(text) && safeHref(text)) {
+    const image = /logo|photo|picture|image|avatar/i.test(key || '');
+    return '<a href="' + safeHref(text) + '" target="_blank" rel="noopener noreferrer">' +
+      (image ? 'Open image' : escHtml(text.length > 70 ? text.slice(0, 67) + '…' : text)) + '</a>';
+  }
+  return escHtml(text);
+}
+// Any value, however nested, as readable rows.
+function csTree(v, key, depth) {
+  depth = depth || 0;
+  if (csEmpty(v)) return '';
+  if (typeof v !== 'object') return csScalar(v, key);
+  if (depth > 5) return escHtml(JSON.stringify(v).slice(0, 300));
+  if (Array.isArray(v)) {
+    if (v.every(x => typeof x !== 'object' || x === null)) return v.filter(x => !csEmpty(x)).map(x => csScalar(x, key)).join(', ');
+    return v.filter(x => !csEmpty(x)).map(x => '<div class="cs-item">' + csTree(x, key, depth + 1) + '</div>').join('');
+  }
+  const rows = Object.keys(v).filter(k => !csEmpty(v[k])).map(k =>
+    '<div class="cs-kv"><span class="cs-k">' + csLabel(k) + '</span><span class="cs-v">' + csTree(v[k], k, depth + 1) + '</span></div>').join('');
+  return rows ? '<div class="cs-tree">' + rows + '</div>' : '';
+}
+function csSection(title, body, hint) {
+  if (!body) return '';
+  return '<section class="cs-section"><h4>' + title + (hint ? ' <span class="muted">' + hint + '</span>' : '') + '</h4>' + body + '</section>';
+}
+function csRow(label, html) {
+  return html ? '<div class="cs-kv"><span class="cs-k">' + label + '</span><span class="cs-v">' + html + '</span></div>' : '';
+}
+function csTags(list) {
+  return list.filter(Boolean).map(t => '<span class="mini ' + (t[1] || '') + '">' + escHtml(t[0]) + '</span>').join(' ');
 }
 
-function contactDetailsPanel(p) {
+function contactSheetHtml(p, i) {
   const d = p.details || {};
-  const row = (label, value) => value ? '<tr><th style="white-space:nowrap;vertical-align:top">' + label +
-    '</th><td style="white-space:normal">' + value + '</td></tr>' : '';
-  const link = u => safeHref(u) ? '<a href="' + safeHref(u) + '" target="_blank" rel="noopener noreferrer">' + escHtml(u) + '</a>' : '';
-  const emails = (d.emails || []).map(e => escHtml(e.email) + ' <span class="muted">' + escHtml(e.kind || '') +
-    (e.verified ? ', marked valid' : '') + (e.used_by_harvey ? ', the one Harvey emails' : '') +
-    (e.kind === 'personal' ? ', never emailed' : '') + '</span>').join('<br>');
-  const phones = (d.phones || []).map(x => escHtml(x.phone) + ' <span class="muted">' +
-    escHtml([x.kind, x.country, x.verified ? 'marked valid' : ''].filter(Boolean).join(', ')) + '</span>').join('<br>');
+  const reply = (d.salesql_reply && typeof d.salesql_reply === 'object') ? d.salesql_reply : {};
+  const prof = (d.company_profile && typeof d.company_profile === 'object') ? d.company_profile : {};
   const c = d.company || {};
-  return '<div style="padding:4px 0"><table><tbody>' +
-    row('LinkedIn', link(p.linkedin_url || d.linkedin_url)) +
-    row('Emails', emails || escHtml(p.email)) +
-    row('Phones', phones || escHtml(p.phone)) +
-    row('Location', escHtml(d.location)) +
-    row('Headline', escHtml(d.headline)) +
-    row('Company', escHtml([c.name || p.company, c.domain, c.industry || p.industry, (c.size || p.company_size) ? (c.size || p.company_size) + ' people' : ''].filter(Boolean).join(' · '))) +
-    row('Found via', link(p.source_url) || escHtml(sourceLabel(p.source))) +
-    row('Notes', escHtml(p.personalization_notes).replace(/\n/g, '<br>')) +
-    '</tbody></table>' +
-    (d.source ? '' : '<p class="muted" style="margin:6px 0 0">Harvey kept only the fields above for this contact.</p>') + '</div>';
+  const link = (u, text) => safeHref(u) ? '<a href="' + safeHref(u) + '" target="_blank" rel="noopener noreferrer">' + escHtml(text || u) + '</a>' : '';
+  const linkedin = p.linkedin_url || d.linkedin_url || reply.linkedin_url;
+
+  const emails = (d.emails && d.emails.length ? d.emails : (p.email ? [{email: p.email, kind: '', used_by_harvey: true}] : []))
+    .map(e => '<div class="cs-line"><span class="cs-main">' + escHtml(e.email) + '</span> ' + csTags([
+      e.kind ? [e.kind === 'personal' ? 'Personal' : 'Work'] : null,
+      e.verified ? ['SalesQL: valid', 't-good'] : null,
+      e.used_by_harvey ? ['Harvey emails this one', 't-good'] : null,
+      e.kind === 'personal' ? ['Never emailed', 't-waiting'] : null]) + '</div>').join('');
+  const phones = (d.phones && d.phones.length ? d.phones : (p.phone ? [{phone: p.phone, shown_by_harvey: true}] : []))
+    .map(x => '<div class="cs-line"><span class="cs-main">' + escHtml(x.phone) + '</span> ' + csTags([
+      x.kind ? [x.kind.charAt(0).toUpperCase() + x.kind.slice(1)] : null,
+      x.country ? [x.country] : null,
+      x.verified ? ['SalesQL: valid', 't-good'] : null,
+      x.shown_by_harvey ? ['Shown in the list', ''] : null]) + '</div>').join('');
+  const reach = csRow('Emails', emails || '<span class="muted">None held</span>') +
+    csRow('Phones', phones || '<span class="muted">None held</span>') + csRow('LinkedIn', link(linkedin));
+
+  // About: the named fields, then every other plain field of the reveal.
+  const shown = new Set(['emails', 'phones', 'linkedin_url', 'headline', 'location', 'full_name', 'first_name', 'last_name',
+    'title', 'uuid', 'organization', 'company', 'work_experience', 'work_experiences', 'experience', 'experiences',
+    'positions', 'employment_history', 'work_history']);
+  let about = csRow('Headline', escHtml(d.headline || reply.headline || '')) +
+    csRow('Location', escHtml(d.location || '')) + csRow('Job title', escHtml(p.title || reply.title || ''));
+  Object.keys(reply).filter(k => !shown.has(k) && !csEmpty(reply[k])).forEach(k => { about += csRow(csLabel(k), csTree(reply[k], k, 1)); });
+
+  let history = '';
+  if (d.work_history && d.work_history.length) {
+    history = d.work_history.map(j => '<div class="cs-item"><div class="cs-main">' + escHtml(j.title || 'Role not given') +
+      (j.company ? ' <span class="muted">at</span> ' + escHtml(j.company) : '') + (j.current ? ' ' + csTags([['Current', 't-good']]) : '') + '</div>' +
+      '<div class="muted">' + escHtml([[j.start, j.end || (j.current ? 'now' : '')].filter(Boolean).join(' to '), j.location, j.company_domain].filter(Boolean).join(' · ')) + '</div>' +
+      (j.description ? '<div class="cs-desc">' + escHtml(j.description) + '</div>' : '') + '</div>').join('');
+  } else if (d.source === 'salesql') {
+    history = '<p class="muted" style="margin:0">' + (d.work_history_asked
+      ? 'SalesQL holds no past jobs for this person.'
+      : 'Not held. This person was revealed before Harvey asked SalesQL for work history. SalesQL charges a credit to ask again, so Harvey does not do it by itself.') + '</p>';
+  }
+
+  const orgShown = new Set(['name', 'website', 'website_domain', 'linkedin_url', 'industry', 'number_of_employees', 'founded_year', 'location', 'type', 'uuid']);
+  let company = csRow('Name', escHtml(prof.name || c.name || p.company || '')) +
+    csRow('Website', link(prof.website || (c.domain ? 'https://' + c.domain : ''), prof.website_domain || c.domain)) +
+    csRow('LinkedIn', link(prof.linkedin_url)) +
+    csRow('Industry', escHtml(prof.industry || c.industry || p.industry || '')) +
+    csRow('People', escHtml(String(prof.number_of_employees || c.size || p.company_size || ''))) +
+    csRow('Founded', escHtml(String(prof.founded_year || ''))) +
+    csRow('Location', csTree(prof.location, 'location', 1)) + csRow('Type', escHtml(String(prof.type || '')));
+  Object.keys(prof).filter(k => !orgShown.has(k) && !csEmpty(prof[k])).forEach(k => { company += csRow(csLabel(k), csTree(prof[k], k, 1)); });
+
+  const harvey = csRow('Status', badge(p.status)) + csRow('Email check', emailTag(p).trim()) +
+    csRow('Score', (p.score || p.score === 0) ? escHtml(String(p.score)) : '') +
+    csRow('Found via', link(p.source_url) || escHtml(sourceLabel(p.source))) +
+    csRow('Added', escHtml(relTime(p.created_at))) +
+    csRow('Revealed', d.revealed_at ? escHtml(relTime(d.revealed_at)) : '') +
+    csRow('Notes', escHtml(p.personalization_notes || '').replace(/\n/g, '<br>'));
+
+  const raw = [['The reveal', reply], ['The company', prof], ['The search result', d.salesql_search]]
+    .filter(x => !csEmpty(x[1])).map(x => '<h5>' + x[0] + '</h5>' + csTree(x[1], '', 0)).join('');
+
+  return '<div class="cs-backdrop" onclick="closeContactSheet()"></div>' +
+    '<aside class="cs-sheet" role="dialog" aria-label="Contact details">' +
+    '<header class="cs-head"><span class="avatar">' + initials(p.first_name, p.last_name) + '</span>' +
+      '<div class="cs-who"><div class="cs-name">' + escHtml(p.first_name) + ' ' + escHtml(p.last_name) + '</div>' +
+      '<div class="muted">' + escHtml([p.title, p.company].filter(Boolean).join(' · ')) + '</div></div>' +
+      '<div class="cs-actions">' + (safeHref(linkedin) ? '<a class="btn btn-secondary btn-sm" href="' + safeHref(linkedin) + '" target="_blank" rel="noopener noreferrer">LinkedIn</a>' : '') +
+      '<button class="btn btn-ghost btn-sm" onclick="fbProspect(' + i + ')">Feedback</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="closeContactSheet()" aria-label="Close">&#10005;</button></div></header>' +
+    '<div class="cs-body">' +
+    csSection('Reach them', reach) + csSection('About', about) + csSection('Work history', history) +
+    csSection('Company', company) + csSection('In Harvey', harvey) +
+    (raw ? '<details class="cs-raw"><summary>Everything SalesQL returned</summary>' + raw + '</details>'
+         : '<p class="muted cs-note">Harvey holds only the fields above for this contact.</p>') +
+    '</div></aside>';
 }
+
+function renderContactSheet() {
+  let host = document.getElementById('contact-sheet');
+  if (!host) { host = document.createElement('div'); host.id = 'contact-sheet'; document.body.appendChild(host); }
+  const i = _prospects.findIndex(p => p.id === _contactOpen);
+  host.innerHTML = i < 0 ? '' : contactSheetHtml(_prospects[i], i);
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && _contactOpen) closeContactSheet(); });
 
 // Why someone is opted out, and undoing it. Harvey never moves anyone off
 // "opted out" on its own, so a mistaken one (a bare "stop" that meant
